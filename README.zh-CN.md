@@ -116,11 +116,14 @@ git clone https://github.com/haohaohao-cell/F446RE-FreeRTOS-LiDAR-Pipeline.git
 > FreeRTOS 的 include 路径已经写进 `.cproject`，不需要再配置任何东西。
 > **不要**打开 `.ioc` 按 Generate Code —— 见下面「坑」。
 
-**命令行**（CubeIDE 工具链已在 PATH 上时）
+**命令行**（可选 —— 必须先让 STM32CubeIDE 生成过一次 `Debug/`）
 
 ```bash
 make -C Debug -j8 all
 ```
+
+`Debug/` 是纯编译产物，已被 git 忽略，里面那些 makefile 是 CubeIDE 生成的。
+所以**第一次编译必须在 IDE 里做**（Ctrl+B），之后命令行也能用。
 
 ### 3. 烧录
 

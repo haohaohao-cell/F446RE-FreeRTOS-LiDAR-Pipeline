@@ -117,11 +117,15 @@ Expected result: **0 warnings, 0 errors**, ~55 kB flash, 42 kB RAM.
 > configuring. Do **not** open the `.ioc` and press *Generate Code* — see
 > [Gotchas](#gotchas).
 
-**Command line** (if you have the CubeIDE toolchain on `PATH`)
+**Command line** (optional - only works after STM32CubeIDE has generated `Debug/` once)
 
 ```bash
 make -C Debug -j8 all
 ```
+
+`Debug/` is git-ignored because it is entirely build output, and the makefiles
+inside it are produced by CubeIDE. So the very first build has to happen in the
+IDE (Ctrl+B); after that the CLI works too.
 
 ### 3. Flash
 
