@@ -144,10 +144,18 @@ _Static_assert(BOARD_MOTOR_PWM_PERIOD <= 65535U, "TIM4 ARR does not fit");
  * flipped here.  Keep it at 1 unless the motor wiring itself changes. */
 #define BOARD_MOTOR_RIGHT_INVERT   1
 
-/* lessonProgram MOTOR_DEFAULT_* values are kept (tuned on the same chassis);
- * they are restated here only so that the numbers have one home. */
+/* lessonProgram MOTOR_DEFAULT_* values are kept as the TARGET clamp (they limit
+ * the requested speed, which is a different thing from the duty).
+ *
+ * The PWM limit, however, had to be raised: measured 2026-11-17 with the car on
+ * the floor, a 20 % duty (168/840 counts) produced only 17 rpm, so reaching the
+ * commanded 59 rpm needs ~70 % duty.  The old 325 count (38.7 %) ceiling made
+ * the requested speed physically unreachable and the car crawled at 28 % of the
+ * target.  Full scale is allowed now; the PID and its integral clamp are what
+ * keep it sane, and a stalled wheel is protected by the 10 ms loop, not by this
+ * number. */
 #define BOARD_MOTOR_TARGET_LIMIT      325
-#define BOARD_MOTOR_PWM_MAX_LIMIT     325
+#define BOARD_MOTOR_PWM_MAX_LIMIT     840   /* = the full PWM period */
 
 /* ========================================================================== */
 /* 4. Wheel encoders: TIM1 (right) and TIM8 (left), hardware x4 decoding     */

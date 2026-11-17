@@ -30,12 +30,15 @@
 /* Waypoint spacing for the straight-line generator. */
 #define PATH_STEP_MM      100
 
-/* ---- tracking limits (ALL UNVERIFIED - 待上板整定) ------------------------ */
-/* These are conservative starting values for a 65 mm-wheel kit chassis.  They
- * are control LOOP gains, not the motor PID gains in motor.h; both must be
- * tuned on the real car before any of the three navigation trials. */
-#define PATH_V_MAX_MM_S     200.0f   /* cruise speed, mm/s                    */
-#define PATH_V_MIN_MM_S      50.0f   /* slowest forward speed while turning   */
+/* ---- tracking limits (first-order values, 待整定 under load) -------------- */
+/* 200 mm/s was the design target but needs ~70 % duty on this chassis (measured:
+ * 20 % duty -> 17 rpm loaded), which leaves no margin for battery sag and makes
+ * the 30 mm arrival radius easy to overshoot.  120 mm/s needs ~40 % duty, so it
+ * is the value used for the first on-ground runs; raise it once the closed loop
+ * is proven.  These are control-LOOP limits, not the motor PID gains in motor.h
+ * - both still need a proper tuning pass with the car loaded. */
+#define PATH_V_MAX_MM_S     120.0f   /* cruise speed, mm/s                    */
+#define PATH_V_MIN_MM_S      40.0f   /* slowest forward speed while turning   */
 #define PATH_KP_HEADING       2.0f   /* (deg/s) per deg of heading error      */
 #define PATH_W_MAX_DPS       90.0f   /* yaw rate clamp                        */
 #define PATH_ARRIVE_MM       30.0f   /* waypoint considered reached           */

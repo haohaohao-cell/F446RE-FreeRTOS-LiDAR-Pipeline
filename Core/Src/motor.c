@@ -4,11 +4,31 @@
 
 #include <stddef.h>
 
-/* PID defaults: Coding Day 2 values, UNTUNED on this chassis.  See motor.h. */
-#define MOTOR_KP_DEFAULT          3.0f
-#define MOTOR_KI_DEFAULT          0.15f
+/* PID defaults.
+ *
+ * The Coding Day 2 values (3.0 / 0.15 / 0) were carried over untuned; on THIS
+ * chassis they were measured on 2026-11-17 to be unusable, and the reason is
+ * arithmetic, not taste:
+ *
+ *   plant (loaded, measured): 168 duty counts -> 17 rpm  =>  ~0.1 rpm per count
+ *   P-only equilibrium     : speed = 0.1 * kp * (target - speed)
+ *                            with kp = 3 that is 23 % of the target speed
+ *                            (measured: 57 mm/s for a 200 mm/s command = 28 %)
+ *
+ * A P controller alone can never hold this plant at the setpoint; the integral
+ * term has to supply the steady-state duty.  It could not, because
+ * MOTOR_INTEGRAL_LIMIT was 120 and ki 0.15, i.e. a maximum contribution of
+ * 18 counts out of 840 - the integrator was effectively disabled.
+ *
+ * New values: keep P for the fast response, give the integrator enough headroom
+ * to supply the full duty range (ki * limit with limit 4000 covers 840 counts
+ * with margin), and let the output clamp do the anti-windup that matters.
+ * Still to be tuned further under load - this is a first-order fix based on the
+ * measurement above, not a validated tuning. */
+#define MOTOR_KP_DEFAULT          5.0f
+#define MOTOR_KI_DEFAULT          0.50f
 #define MOTOR_KD_DEFAULT          0.0f
-#define MOTOR_INTEGRAL_LIMIT      120.0f
+#define MOTOR_INTEGRAL_LIMIT      4000.0f
 #define MOTOR_TARGET_RAMP_STEP    4
 #define MOTOR_LEFT_SCALE          1.08f
 #define MOTOR_RIGHT_SCALE         1.0f
