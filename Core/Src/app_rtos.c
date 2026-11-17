@@ -273,6 +273,27 @@ void app_rtos_bt_rx_event(void)
   (void)osSemaphoreRelease(sem_bt_rx);
 }
 
+/* ---- bench (open-loop) mode, for hardware bring-up only ------------------- */
+/* 'f' / 'b' apply a fixed duty to both wheels for one short burst; 'x' stops.
+ * Only ever used with the wheels OFF the ground.
+ *
+ * Why a timeout: the console is a single keypress.  If the byte is dropped, the
+ * terminal window is closed or the operator's hand slips, a duty left applied
+ * would drive the car away.  BENCH_HOLD_MS bounds that to 1.5 s.
+ *
+ * Why the PID task applies it: the motor has exactly one owner
+ * (CODING_STANDARDS 0.3).  While a burst is active the task forces
+ * have_wp = 0 and stopped = 1, which makes both branches of the tracking code
+ * no-ops, so the open-loop write is the only motor write in that cycle.  On the
+ * cycle the burst ends, bench_latched makes the task call motor_stop() once -
+ * without it the last CCR value would keep the wheels turning after 'x'. */
+#define BENCH_DUTY_PCT     20      /* open-loop duty, percent              */
+#define BENCH_HOLD_MS    1500U     /* burst length, milliseconds           */
+
+static volatile int8_t   bench_duty;        /* 0 = off, else -100..+100     */
+static volatile uint32_t bench_deadline_ms; /* HAL tick when the burst ends */
+static uint8_t           bench_latched;     /* duty is currently applied    */
+
 /* ========================================================================== */
 /* Task 1: PID + Motor (10 ms)                                                */
 /* ========================================================================== */
@@ -316,6 +337,26 @@ static void pid_motor_task(void *argument)
        * queue get below takes the new first waypoint in this same cycle, so
        * there is no unnecessary brake between retargets. */
       have_wp = 0U;
+    }
+
+    /* ---- bench burst: open-loop drive, wheels off the ground -------------- */
+    if ((bench_duty != 0) && ((int32_t)(bench_deadline_ms - HAL_GetTick()) > 0))
+    {
+      have_wp = 0U;   /* cancel tracking; the queue keeps its waypoints */
+      stopped = 1U;
+      motor_set_duty_percent(bench_duty, bench_duty);
+      bench_latched = 1U;
+    }
+    else if (bench_latched != 0U)
+    {
+      /* Burst finished (timeout or 'x').  Stop here, once, so the PWM really goes
+       * to zero instead of holding the last CCR value. */
+      bench_duty = 0;
+      bench_latched = 0U;
+      have_wp = 0U;
+      stopped = 1U;
+      motor_stop();
+      dbg_printf("[bench] burst done, motor stopped\r\n");
     }
 
     {
@@ -636,9 +677,31 @@ static void console_poll(void)
     lidar_request_resume();
     dbg_printf("[cmd] g -> restarting LiDAR\r\n");
   }
+  else if ((ch == (uint8_t)'f') || (ch == (uint8_t)'F'))
+  {
+    bench_duty = (int8_t)BENCH_DUTY_PCT;
+    bench_deadline_ms = HAL_GetTick() + BENCH_HOLD_MS;
+    dbg_printf("[bench] forward %d%% for %lu ms - wheels OFF the ground\r\n",
+               (int)BENCH_DUTY_PCT, (unsigned long)BENCH_HOLD_MS);
+  }
+  else if ((ch == (uint8_t)'b') || (ch == (uint8_t)'B'))
+  {
+    bench_duty = (int8_t)(-BENCH_DUTY_PCT);
+    bench_deadline_ms = HAL_GetTick() + BENCH_HOLD_MS;
+    dbg_printf("[bench] reverse %d%% for %lu ms - wheels OFF the ground\r\n",
+               (int)BENCH_DUTY_PCT, (unsigned long)BENCH_HOLD_MS);
+  }
+  else if ((ch == (uint8_t)'x') || (ch == (uint8_t)'X'))
+  {
+    /* Only clears the request: the PID task performs the actual motor_stop()
+     * on its next 10 ms cycle, so the motor keeps a single owner. */
+    bench_duty = 0;
+    dbg_printf("[bench] stop requested\r\n");
+  }
   else if ((ch == (uint8_t)'h') || (ch == (uint8_t)'H') || (ch == (uint8_t)'?'))
   {
-    dbg_printf("[cmd] s=stop lidar g=restart lidar h=help\r\n");
+    dbg_printf("[cmd] s=stop lidar  g=restart lidar  f=bench fwd  "
+               "b=bench rev  x=bench stop  h=help\r\n");
   }
   else
   {
@@ -813,7 +876,7 @@ static void status_line_1hz(void)
              (unsigned long)((hold_us % 1000U) / 100U),
              (unsigned long)rs.heap_free,
              (unsigned)rs.heap_total,
-             (unsigned)0U,   /* IWDG is not enabled yet - see HANDOVER "待上板" */
+             (unsigned)0U,   /* IWDG is not enabled yet - see HANDOVER section 7 */
              (unsigned long)imu_hz);
 
   /* ---- line 4: stacks, in the documented order ------------------------- */
