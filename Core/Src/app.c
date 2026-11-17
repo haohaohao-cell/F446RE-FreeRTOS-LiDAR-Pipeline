@@ -1,9 +1,13 @@
 #include "app.h"
 #include "main.h"
+#include "board_pins.h"
 #include "lidar.h"
 #include "imu.h"
 #include "telemetry.h"
 #include "app_rtos.h"
+#include "motor.h"
+#include "encoder.h"
+#include "tim_cal.h"
 
 #include "FreeRTOS.h"
 
@@ -15,6 +19,7 @@ extern UART_HandleTypeDef huart5;
 extern UART_HandleTypeDef huart2;
 extern UART_HandleTypeDef huart3;
 extern I2C_HandleTypeDef hi2c1;
+extern TIM_HandleTypeDef htim6;
 
 /* ========================================================================== */
 /* boot-time helpers                                                          */
@@ -44,18 +49,15 @@ void dbg_printf(const char *fmt, ...)
   }
 }
 
-static void motors_safe(void)
-{
-  GPIO_InitTypeDef g = {0};
-
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_RESET);
-  g.Pin = GPIO_PIN_6 | GPIO_PIN_7;
-  g.Mode = GPIO_MODE_OUTPUT_PP;
-  g.Pull = GPIO_NOPULL;
-  g.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &g);
-}
+/* -----------------------------------------------------------------------------
+ * Motor / H-bridge safe state is no longer configured here.
+ *
+ * It used to be a local motors_safe() that drove PB6/PB7 as plain GPIO outputs.
+ * Part 2 needs those same two pins as TIM4_CH1/CH2, and two writers of one pin
+ * configuration is exactly the "last writer wins" failure mode that hit the
+ * NVIC table (HANDOVER 5.3).  The safe state is now motor_init()'s first step,
+ * so there is a single owner: motor.c.
+ * -------------------------------------------------------------------------- */
 
 /* -----------------------------------------------------------------------------
  * NVIC priorities.
@@ -99,13 +101,19 @@ static void irq_priorities(void)
 void app_init(void)
 {
   int imu_status;
+  tim_cal_result_t cal_motor;
+  tim_cal_result_t cal_fast;
 
   dwt_init();          /* must be first: everything below times itself with DWT */
-  motors_safe();
+
+  /* Motor and encoder hardware.  motor_init() starts with both H-bridge inputs
+   * low and 0 % duty, so the car cannot move before the scheduler exists.
+   * encoder_init() only starts the two QEP counters; nothing reads them yet. */
+  motor_init();
+  encoder_init();
 
   telemetry_init();
   imu_status = imu_init();
-  imu_start();
 
   /* Re-assert the final NVIC map *after* every driver has had its say:
    * HAL_xxx_MspInit(), telemetry_dma_init() and i2c_bus_recover() all write
@@ -116,6 +124,19 @@ void app_init(void)
    * stm32f4xx_hal_timebase_tim.c).  Must run before anything relies on
    * HAL_GetTick(). */
   hal_timebase_calibrate();
+
+  /* Same treatment for the two Part 2 time bases, for the same reason: this
+   * board's APB1 timer clock does not match the reference manual (HANDOVER 5.2).
+   *   - PWM timers: nominal 20 kHz.  TIM2 inherits TIM4's calibrated
+   *     prescaler instead of being measured twice (same kernel clock).
+   *   - TIM6: nominal 100 Hz, i.e. the 10 ms control cadence.
+   * Both MUST be correct before osKernelStart() and, for TIM6, before
+   * imu_start() arms the update interrupt. */
+  (void)hal_tim_calibrate(motor_left_timer_handle(), BOARD_MOTOR_PWM_HZ, &cal_motor);
+  motor_sync_pwm_clock();
+  (void)hal_tim_calibrate(&htim6, 100U, &cal_fast);
+
+  imu_start();
 
   /* Create both queues and both tasks.  This MUST happen before lidar_init(),
    * because lidar_init() starts the circular DMA reception and the very first
@@ -149,6 +170,28 @@ void app_init(void)
              (unsigned long)hal_timebase_calib_irqs,
              (unsigned long)hal_timebase_calib_expect,
              (unsigned long)hal_timebase_timpre_found);
+
+  /* Part 2 time bases: nominal / measured / corrected, all three printed so a
+   * mismatch is visible in a captured boot log instead of being silent. */
+  dbg_printf("pwm clk: nominal=%luHz measured=%luHz psc %lu->%lu "
+             "update %lu->%luHz%s\r\n",
+             (unsigned long)cal_motor.nominal_hz,
+             (unsigned long)cal_motor.measured_clk_hz,
+             (unsigned long)cal_motor.psc_before,
+             (unsigned long)cal_motor.psc_after,
+             (unsigned long)cal_motor.update_hz_before,
+             (unsigned long)cal_motor.update_hz_after,
+             (cal_motor.corrected != 0U) ? " (corrected)" : "");
+
+  dbg_printf("fast tick: nominal=%luHz measured=%luHz psc %lu->%lu "
+             "update %lu->%luHz%s\r\n",
+             (unsigned long)cal_fast.nominal_hz,
+             (unsigned long)cal_fast.measured_clk_hz,
+             (unsigned long)cal_fast.psc_before,
+             (unsigned long)cal_fast.psc_after,
+             (unsigned long)cal_fast.update_hz_before,
+             (unsigned long)cal_fast.update_hz_after,
+             (cal_fast.corrected != 0U) ? " (corrected)" : "");
 
   /* Verified: 50 ms of DWT cycles must advance HAL_GetTick() by 50. */
   {
