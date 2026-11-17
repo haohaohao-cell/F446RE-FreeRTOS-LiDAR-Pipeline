@@ -1,99 +1,252 @@
 /* -----------------------------------------------------------------------------
- * app_rtos.c - Block 4.5 Coding Day: the FreeRTOS side of the LiDAR pipeline
+ * app_rtos.c - the 8-thread architecture (see app_rtos.h for the table).
  *
- *                       ISR (USART3 / DMA1_Stream1)
- *                                |
- *                                | osMessageQueuePut(timeout = 0, ISR ctx)
- *                                v
- *                        +---------------+
- *                        |    Queue 1    |  8 x lidar_block_desc_t (12 bytes)
- *                        +---------------+
- *                                |
- *                                | osMessageQueueGet(osWaitForever)
- *                                v
- *                     LiDAR Parser Task   (osPriorityAboveNormal)
- *                                |
- *                                | osMessageQueuePut(timeout = 0)
- *                                v
- *                        +---------------+
- *                        |    Queue 2    |  4 x lidar_result_t (32 bytes)
- *                        +---------------+
- *                                |
- *                                | osMessageQueueGet(100 ms guard timeout)
- *                                v
- *                    Output / Debug Task   (osPriorityNormal)
- *                                |
- *                 +--------------+--------------+
- *                 |                             |
- *          USART2 text (115200)          UART5 binary (230400)
+ * DATA FLOW
+ * ---------
+ *   USART3/DMA1_S1 ISR --Q_Lidar--> LiDAR task --> lidar.c 360-bin map
+ *   UART5/DMA1_S0 ISR  --sem-----> BT RX task  --sink--> Q_Cmd
+ *   Q_Cmd --> PathGen task --Q_Path--> PID+Motor task --> motor.c --> TIM4/TIM2
+ *   TIM6 ISR --sem--> IMU task --> i2c_bus --> MPU-6500
+ *   Pose task (10 ms) samples TIM1/TIM8 + the IMU heading -> pose.c
+ *   BT TX task (50 ms) pushes the binary telemetry frame the PC viewer needs
+ *   OLED task (50 ms) draws one page per slot and prints the 1 Hz status block
  *
- * Priority rationale: the parser must always be able to drain Queue 1 before
- * DMA wraps around and overwrites the next block, so it runs above the Output
- * task.  The Output task is deliberately the lower one - it only formats and
- * pushes bytes out and may legitimately be preempted.
+ * WHY THE 1 Hz BLOCK IS PRINTED FROM THE OLED TASK: it is the lowest-priority
+ * task in the system, so formatting and queueing those characters can never
+ * delay a control deadline (CODING_STANDARDS 5.4).  The output itself is
+ * non-blocking (log.c: ring + DMA), so even there it does not stall.
+ *
+ * NO QUEUE FOR ENCODER DATA AND NONE FOR SETPOINTS: the encoders are hardware
+ * QEP counters read by the Pose task, and the PID/motor pair shares one task so
+ * the setpoint is a local variable.  That is what "Q_Enc / Q_Set are not
+ * introduced" means in practice (CODING_STANDARDS 1.2).
  * -------------------------------------------------------------------------- */
 
 #include "app_rtos.h"
 #include "app.h"
 #include "main.h"
+#include "board_pins.h"
+
 #include "lidar.h"
 #include "imu.h"
 #include "telemetry.h"
+#include "oled.h"
+#include "bt_rx.h"
+#include "bt_protocol.h"
+#include "i2c_bus.h"
+#include "pose.h"
+#include "path.h"
+#include "motor.h"
+#include "encoder.h"
+#include "log.h"
 
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
 #include "task.h"
-#include "queue.h"
 
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 extern UART_HandleTypeDef huart2;   /* debug console, polled for 's' / 'g' */
 
-/* -------------------------------------------------------------------------- */
+/* ========================================================================== */
 /* RTOS objects                                                               */
-/* -------------------------------------------------------------------------- */
-static osMessageQueueId_t q_blocks;    /* Queue 1: ISR      -> Parser Task     */
-static osMessageQueueId_t q_results;   /* Queue 2: Parser   -> Output Task     */
-static osThreadId_t       t_parser;
-static osThreadId_t       t_output;
+/* ========================================================================== */
+static osMessageQueueId_t q_lidar;   /* ISR      -> LiDAR task              */
+static osMessageQueueId_t q_cmd;     /* BT RX    -> PathGen                 */
+static osMessageQueueId_t q_path;    /* PathGen  -> PID + Motor             */
+static osSemaphoreId_t    sem_imu;   /* TIM6 ISR -> IMU task                */
+static osSemaphoreId_t    sem_bt_rx; /* UART5 ISR -> BT RX task             */
+static osEventFlagsId_t   evt_nav;   /* STOP / NEW_PATH notifications       */
+
+static osThreadId_t t_pid;
+static osThreadId_t t_imu;
+static osThreadId_t t_pose;
+static osThreadId_t t_lidar;
+static osThreadId_t t_path;
+static osThreadId_t t_bt_rx;
+static osThreadId_t t_bt_tx;
+static osThreadId_t t_oled;
 
 static app_rtos_stats_t rtos_stats;
 
-/* Snapshot of the rolling 360-bin scan, assembled by the Output task */
+/* Timing state is kept separate from the published copy so a 1 Hz snapshot can
+ * never tear a value that a task is updating. */
+typedef struct
+{
+  uint32_t last_cyc;
+  uint32_t start_cyc;
+} timing_int_t;
+
+static timing_int_t   timing_int[APP_TIMING_COUNT];
+static app_timing_t   timing_pub[APP_TIMING_COUNT];
+
+/* Snapshot of the rolling 360-bin scan, assembled by the BT TX task. */
 static uint16_t scan_frame[LIDAR_BINS];
 static uint8_t  qual_frame[LIDAR_BINS];
 
-/* -------------------------------------------------------------------------- */
-/* Task attributes                                                            */
-/* -------------------------------------------------------------------------- */
-static const osThreadAttr_t parser_attr = {
-  .name       = "lidarParser",
-  .stack_size = APP_PARSER_STACK,
-  .priority   = (osPriority_t)osPriorityAboveNormal,
+/* ========================================================================== */
+/* task attributes                                                            */
+/* ========================================================================== */
+static const osThreadAttr_t pid_motor_attr = {
+  .name = "pidMotor", .stack_size = APP_STK_PID_MOTOR, .priority = (osPriority_t)APP_PRIO_PID_MOTOR,
+};
+static const osThreadAttr_t imu_attr = {
+  .name = "imuAcq", .stack_size = APP_STK_IMU, .priority = (osPriority_t)APP_PRIO_IMU,
+};
+static const osThreadAttr_t pose_attr = {
+  .name = "pose", .stack_size = APP_STK_POSE, .priority = (osPriority_t)APP_PRIO_POSE,
+};
+static const osThreadAttr_t lidar_attr = {
+  .name = "lidarProc", .stack_size = APP_STK_LIDAR, .priority = (osPriority_t)APP_PRIO_LIDAR,
+};
+static const osThreadAttr_t path_attr = {
+  .name = "pathGen", .stack_size = APP_STK_PATH, .priority = (osPriority_t)APP_PRIO_PATH,
+};
+static const osThreadAttr_t bt_rx_attr = {
+  .name = "btRx", .stack_size = APP_STK_BT_RX, .priority = (osPriority_t)APP_PRIO_BT_RX,
+};
+static const osThreadAttr_t bt_tx_attr = {
+  .name = "btTx", .stack_size = APP_STK_BT_TX, .priority = (osPriority_t)APP_PRIO_BT_TX,
+};
+static const osThreadAttr_t oled_attr = {
+  .name = "oled", .stack_size = APP_STK_OLED, .priority = (osPriority_t)APP_PRIO_OLED,
 };
 
-static const osThreadAttr_t output_attr = {
-  .name       = "outputDebug",
-  .stack_size = APP_OUTPUT_STACK,
-  .priority   = (osPriority_t)osPriorityNormal,
-};
-
-static const osMessageQueueAttr_t q_blocks_attr  = { .name = "qBlocks" };
-static const osMessageQueueAttr_t q_results_attr = { .name = "qResults" };
+static const osMessageQueueAttr_t q_lidar_attr = { .name = "qLidar" };
+static const osMessageQueueAttr_t q_cmd_attr   = { .name = "qCmd"   };
+static const osMessageQueueAttr_t q_path_attr  = { .name = "qPath"  };
+static const osSemaphoreAttr_t    sem_imu_attr = { .name = "semImu"    };
+static const osSemaphoreAttr_t    sem_bt_attr  = { .name = "semBtRx"   };
+static const osEventFlagsAttr_t   evt_nav_attr = { .name = "evtNav"    };
 
 /* ========================================================================== */
-/* ISR side                                                                   */
+/* timing helpers (DWT, µs resolution)                                        */
 /* ========================================================================== */
+static uint32_t cyc_to_us(uint32_t cycles)
+{
+  return (uint32_t)(((uint64_t)cycles * 1000000ULL) / (uint64_t)SystemCoreClock);
+}
 
-/* CMSIS-RTOS v2 has no "FromISR" variants.  ST's cmsis_os2.c detects interrupt
- * context itself and switches to xQueueSendToBackFromISR() + portYIELD_FROM_ISR().
- * Consequence: from an ISR the timeout argument MUST be 0.
- * Precondition: the calling ISR's NVIC priority must be numerically >=
- * configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY, otherwise it triggers
- * configASSERT (vPortValidateInterruptPriority). */
+/* Call at the top of a periodic task, before doing the work. */
+static void timing_begin(uint32_t slot, uint32_t nominal_us)
+{
+  app_timing_t *t = &timing_pub[slot];
+  timing_int_t *s = &timing_int[slot];
+  uint32_t now = DWT->CYCCNT;
+
+  if (t->activations != 0U)
+  {
+    uint32_t period_us = cyc_to_us(now - s->last_cyc);
+    uint32_t jitter_us;
+
+    if ((t->period_us_min == 0U) || (period_us < t->period_us_min))
+    {
+      t->period_us_min = period_us;
+    }
+    if (period_us > t->period_us_max)
+    {
+      t->period_us_max = period_us;
+    }
+
+    jitter_us = (period_us > nominal_us) ? (period_us - nominal_us)
+                                         : (nominal_us - period_us);
+    if (jitter_us > t->jitter_us_max)
+    {
+      t->jitter_us_max = jitter_us;
+    }
+  }
+
+  s->last_cyc = now;
+  s->start_cyc = now;
+  t->activations++;
+}
+
+/* Call after the work, before osDelayUntil(). */
+static void timing_end(uint32_t slot)
+{
+  uint32_t wcet_us = cyc_to_us(DWT->CYCCNT - timing_int[slot].start_cyc);
+
+  if (wcet_us > timing_pub[slot].wcet_us_max)
+  {
+    timing_pub[slot].wcet_us_max = wcet_us;
+  }
+}
+
+/* CODING_STANDARDS 1.3: a wake-up more than one period late is an overrun and
+ * must be visible, never silently absorbed by osDelayUntil(). */
+static void timing_check_late(uint32_t slot, uint32_t target_tick, uint32_t period_ms)
+{
+  if ((uint32_t)(osKernelGetTickCount() - target_tick) >= period_ms)
+  {
+    timing_pub[slot].overruns++;
+  }
+}
+
+/* ========================================================================== */
+/* small display helper                                                       */
+/* ========================================================================== */
+/* Fixed 6x8 cells, 21 columns.  A longer string is clipped by oled.c, which is
+ * the behaviour we want for a status screen (no wrapping onto the next row). */
+static void oled_row(uint8_t row, const char *fmt, ...)
+{
+  char buf[24];
+  va_list ap;
+
+  va_start(ap, fmt);
+  (void)vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+
+  (void)oled_show_text(row, 0U, buf);
+}
+
+/* ========================================================================== */
+/* Q_Cmd sink (installed into bt_rx by app_rtos_init)                         */
+/* ========================================================================== */
+/* Overflow policy for Q_Cmd: overwrite the OLDEST command, because when a user
+ * taps "go" twice the newest target is the one they mean
+ * (CODING_STANDARDS 2.2).  The overwrite is counted, never silent. */
+static int cmd_sink(const cmd_msg_t *msg)
+{
+  uint32_t depth;
+
+  if (msg == NULL)
+  {
+    return BT_ERR_SYNTAX;
+  }
+
+  if (osMessageQueuePut(q_cmd, msg, 0U, 0U) != osOK)
+  {
+    cmd_msg_t discarded;
+
+    if (osMessageQueueGet(q_cmd, &discarded, 0U, 0U) != osOK)
+    {
+      return BT_ERR_BUSY;
+    }
+    rtos_stats.q_cmd_overwrite++;
+
+    if (osMessageQueuePut(q_cmd, msg, 0U, 0U) != osOK)
+    {
+      return BT_ERR_BUSY;
+    }
+  }
+
+  depth = osMessageQueueGetCount(q_cmd);
+  if (depth > rtos_stats.q_cmd_peak)
+  {
+    rtos_stats.q_cmd_peak = depth;
+  }
+  return BT_OK;
+}
+
+/* ========================================================================== */
+/* ISR-side entry points                                                      */
+/* ========================================================================== */
 int app_rtos_post_block(const lidar_block_desc_t *desc)
 {
-  if (osMessageQueuePut(q_blocks, desc, 0U, 0U) != osOK)
+  if (osMessageQueuePut(q_lidar, desc, 0U, 0U) != osOK)
   {
     rtos_stats.blocks_dropped++;
     return -1;
@@ -102,43 +255,229 @@ int app_rtos_post_block(const lidar_block_desc_t *desc)
   return 0;
 }
 
-/* ========================================================================== */
-/* Task 1: LiDAR Parser Task                                                  */
-/* ========================================================================== */
-static void parser_task(void *argument)
+int app_rtos_imu_tick(void)
 {
-  lidar_block_desc_t desc;
-  lidar_result_t     result;
+  /* osSemaphoreRelease() from an ISR is legal: ST's cmsis_os2.c detects the
+   * context itself (CODING_STANDARDS 2.3).  A full semaphore means the IMU task
+   * has not consumed the previous tick - that is an overrun, reported upward. */
+  if (osSemaphoreRelease(sem_imu) != osOK)
+  {
+    rtos_stats.imu_ticks_unused++;
+    return -1;
+  }
+  return 0;
+}
 
+void app_rtos_bt_rx_event(void)
+{
+  (void)osSemaphoreRelease(sem_bt_rx);
+}
+
+/* ========================================================================== */
+/* Task 1: PID + Motor (10 ms)                                                */
+/* ========================================================================== */
+static void pid_motor_task(void *argument)
+{
+  uint32_t tick = osKernelGetTickCount();
+  path_point_t wp;
+  uint8_t  have_wp = 0U;
+  uint8_t  stopped = 1U;
   (void)argument;
+
+  dbg_task_started("pidMotor", APP_PERIOD_FAST_MS, APP_PRIO_PID_MOTOR, APP_STK_PID_MOTOR);
 
   for (;;)
   {
-    osStatus_t st;
+    uint32_t nav_flags;
 
-    /* ---- BLOCKED here until Queue 1 receives a block descriptor.
-     *
-     * The timeout is NOT used to poll for data - the data path is purely
-     * event driven.  It only exists so that the stream watchdog inside
-     * lidar_parser_service() still runs when the sensor is silent (e.g. the
-     * SCAN command was lost at power-up): with osWaitForever the parser would
-     * block forever and never re-issue the command, and the pipeline would
-     * deadlock silently.  100 ms is ~4 block periods, so in normal operation
-     * the timeout never fires. ------------------------------------------- */
-    st = osMessageQueueGet(q_blocks, &desc, NULL, APP_PARSER_IDLE_MS);
+    tick += APP_PERIOD_FAST_MS;
+    timing_begin(APP_TIMING_PID_MOTOR, APP_PERIOD_FAST_MS * 1000U);
 
-    if (st == osOK)
+    /* Consume the one-shot navigation notifications.  Both bits are requested in
+     * one call and tested bitwise: osEventFlagsWait() returns the whole flag
+     * word, so comparing the result against a single bit with == would drop a
+     * STOP that arrived together with NEW_PATH - and a dropped STOP means the
+     * car keeps driving. */
+    nav_flags = osEventFlagsWait(evt_nav,
+                                 (uint32_t)APP_NAV_EVT_STOP | (uint32_t)APP_NAV_EVT_NEW_PATH,
+                                 osFlagsWaitAny, 0U);
+
+    if ((nav_flags & (uint32_t)APP_NAV_EVT_STOP) != 0U)
     {
-      rtos_stats.blocks_consumed++;
+      have_wp = 0U;
+      stopped = 1U;
+      motor_stop();
+    }
+    else if ((nav_flags & (uint32_t)APP_NAV_EVT_NEW_PATH) != 0U)
+    {
+      /* A new path replaced the old one.  Drop the waypoint this task is
+       * currently following, otherwise the car would finish tracking the OLD
+       * path before noticing the new command.  `stopped` is left alone and the
+       * queue get below takes the new first waypoint in this same cycle, so
+       * there is no unnecessary brake between retargets. */
+      have_wp = 0U;
+    }
+
+    {
+      pose_t pose;
+
+      pose_get(&pose);
+
+      /* 1. Is the waypoint we are following already reached? */
+      if ((have_wp != 0U) && (path_arrived(&pose, &wp) != 0U))
       {
-        uint32_t used = osMessageQueueGetCount(q_blocks);
-        if (used > rtos_stats.q1_peak)
+        path_note_reached();
+        have_wp = 0U;
+
+        if (path_is_final(&wp) != 0U)
         {
-          rtos_stats.q1_peak = used;
+          path_note_finished();
         }
       }
 
-      /* ---- READY -> RUNNING: parse the block straight out of the DMA buf */
+      /* 2. Take the next waypoint.  The loop matters: a 100 mm waypoint can
+       * already be inside PATH_ARRIVE_MM right after the previous one, and
+       * braking for one cycle at every step would make the car judder along the
+       * whole path.  Consecutive waypoints are consumed in the SAME cycle, so
+       * the motor outputs are never zeroed between two pieces of one path. */
+      if (have_wp == 0U)
+      {
+        while (osMessageQueueGet(q_path, &wp, NULL, 0U) == osOK)
+        {
+          uint32_t depth = osMessageQueueGetCount(q_path);
+
+          if (depth > rtos_stats.q_path_peak)
+          {
+            rtos_stats.q_path_peak = depth;
+          }
+
+          if (path_arrived(&pose, &wp) == 0U)
+          {
+            have_wp = 1U;
+            break;
+          }
+
+          /* Already inside the arrival radius: skip it. */
+          path_note_reached();
+          if (path_is_final(&wp) != 0U)
+          {
+            path_note_finished();
+            break;
+          }
+        }
+      }
+
+      if (have_wp != 0U)
+      {
+        int16_t rpm_l = 0;
+        int16_t rpm_r = 0;
+
+        path_track_step(&pose, &wp, &rpm_l, &rpm_r);
+        motor_set_target_rpm(rpm_l, rpm_r);
+        stopped = 0U;
+
+        /* One PID step, one CCR write - never split across a blocking call
+         * (CODING_STANDARDS 1.2.2).  The feedback is the value the Pose task
+         * published on the previous 10 ms edge, i.e. at most one period old.
+         *
+         * motor_update() is deliberately NOT called while idle: with a zero
+         * target the PID would drive the PWM against the coasting wheels
+         * (feedback != 0), i.e. actively brake instead of leaving the outputs
+         * at 0.  "PWM to 0 within one period" (CODING_STANDARDS 3.3) requires
+         * the outputs to be written by motor_stop() and left alone. */
+        motor_update(encoder_left_rpm(), encoder_right_rpm());
+      }
+      else if (stopped == 0U)
+      {
+        /* No waypoint left: stop, once. */
+        motor_stop();
+        stopped = 1U;
+      }
+    }
+
+    timing_end(APP_TIMING_PID_MOTOR);
+    osDelayUntil(tick);
+    timing_check_late(APP_TIMING_PID_MOTOR, tick, APP_PERIOD_FAST_MS);
+  }
+}
+
+/* ========================================================================== */
+/* Task 2: IMU acquisition (event: TIM6 semaphore)                            */
+/* ========================================================================== */
+static void imu_task(void *argument)
+{
+  (void)argument;
+
+  dbg_task_started("imuAcq", 0U, APP_PRIO_IMU, APP_STK_IMU);
+
+  for (;;)
+  {
+    /* The ONLY reason this task exists in this shape: the sample must happen in
+     * task context so the bus mutex can be held across the transfer. */
+    if (osSemaphoreAcquire(sem_imu, APP_IMU_WAIT_MS) == osOK)
+    {
+      (void)imu_sample_once();
+    }
+    else
+    {
+      /* No tick for 100 ms: TIM6 has stopped.  Counted so it cannot hide. */
+      rtos_stats.imu_wait_timeouts++;
+    }
+  }
+}
+
+/* ========================================================================== */
+/* Task 3: Pose estimation (10 ms)                                            */
+/* ========================================================================== */
+static void pose_task(void *argument)
+{
+  uint32_t tick = osKernelGetTickCount();
+  (void)argument;
+
+  dbg_task_started("pose", APP_PERIOD_FAST_MS, APP_PRIO_POSE, APP_STK_POSE);
+
+  for (;;)
+  {
+    tick += APP_PERIOD_FAST_MS;
+    timing_begin(APP_TIMING_POSE, APP_PERIOD_FAST_MS * 1000U);
+
+    pose_update(APP_PERIOD_FAST_MS);
+
+    timing_end(APP_TIMING_POSE);
+    osDelayUntil(tick);
+    timing_check_late(APP_TIMING_POSE, tick, APP_PERIOD_FAST_MS);
+  }
+}
+
+/* ========================================================================== */
+/* Task 4: LiDAR processing (event: Q_Lidar)                                  */
+/* ========================================================================== */
+static void lidar_task(void *argument)
+{
+  lidar_block_desc_t desc;
+  lidar_result_t     result;
+  (void)argument;
+
+  dbg_task_started("lidarProc", 0U, APP_PRIO_LIDAR, APP_STK_LIDAR);
+
+  for (;;)
+  {
+    /* The 100 ms guard is NOT a poll: it exists so the stream watchdog inside
+     * lidar_parser_service() still runs when the sensor goes silent (e.g. the
+     * SCAN command was lost at power-up).  In normal operation it never fires.
+     */
+    osStatus_t st = osMessageQueueGet(q_lidar, &desc, NULL, APP_Q_LIDAR_GUARD_MS);
+
+    if (st == osOK)
+    {
+      uint32_t depth = osMessageQueueGetCount(q_lidar);
+
+      rtos_stats.blocks_consumed++;
+      if (depth > rtos_stats.q_lidar_peak)
+      {
+        rtos_stats.q_lidar_peak = depth;
+      }
+
       lidar_parser_process(&desc, &result);
       result.tick = osKernelGetTickCount();
 
@@ -150,275 +489,531 @@ static void parser_task(void *argument)
       {
         rtos_stats.max_handover_us = result.handover_us;
       }
-
-      /* ---- hand the processed result to the Output task ---------------- */
-      if (osMessageQueuePut(q_results, &result, 0U, 0U) != osOK)
-      {
-        rtos_stats.results_dropped++;
-      }
-      else
-      {
-        rtos_stats.results_posted++;
-      }
-      {
-        uint32_t used = osMessageQueueGetCount(q_results);
-        if (used > rtos_stats.q2_peak)
-        {
-          rtos_stats.q2_peak = used;
-        }
-      }
     }
     else
     {
       rtos_stats.parser_idle_wakeups++;
     }
 
-    /* Re-arm / resync work that is not allowed in interrupt context.
-     * Runs on every wake-up, including the "no block arrived" case. */
     lidar_parser_service();
   }
 }
 
 /* ========================================================================== */
-/* Task 2: Output / Debug Task                                                */
+/* Task 5: Path generation (event: Q_Cmd)                                     */
 /* ========================================================================== */
-static void output_task(void *argument)
+static void path_task(void *argument)
 {
-  lidar_result_t  last;
-  uint8_t         have_result = 0U;
-  uint32_t        t_frame;
-  uint32_t        t_stats;
-  uint32_t        prev_bytes = 0U;
-  uint32_t        prev_ms = 0U;
-  uint32_t        prev_ktick = 0U;
-  uint32_t        prev_blocks = 0U;
-
+  static path_point_t pts[Q_PATH_CAPACITY];
+  cmd_msg_t cmd;
   (void)argument;
 
-  t_frame = osKernelGetTickCount();
-  t_stats = t_frame;
-  prev_ms = HAL_GetTick();
-  prev_ktick = t_frame;
+  dbg_task_started("pathGen", 0U, APP_PRIO_PATH, APP_STK_PATH);
 
   for (;;)
   {
-    /* ---- BLOCKED here until the parser posts a result.
-     * The 100 ms guard timeout still lets this task service the IMU and the
-     * 1 Hz statistics line if the LiDAR stops producing blocks. ---------- */
-    if (osMessageQueueGet(q_results, &last, NULL, APP_FRAME_PERIOD_MS) == osOK)
+    if (osMessageQueueGet(q_cmd, &cmd, NULL, osWaitForever) != osOK)
     {
-      have_result = 1U;
+      continue;
     }
 
-    /* ---- debug console: one-shot non-blocking read of USART2 RX ---------
-     *   s  -> stop the LiDAR   (the cheap, cable-free way to demonstrate
-     *                           "sensor goes silent" without touching wiring)
-     *   g  -> restart the LiDAR
-     *   h  -> help                                                          */
+    if (cmd.type == (uint8_t)CMD_TYPE_GO)
     {
-      uint8_t ch = 0U;
-      if (HAL_UART_Receive(&huart2, &ch, 1U, 0U) == HAL_OK)
+      pose_t pose;
+      int n;
+      int i;
+      uint8_t put_failed = 0U;
+
+      pose_get(&pose);
+
+      /* Until odometry is calibrated, pose is (0,0) at boot, so this is a
+       * straight line from "where we think we are" to the commanded point.  No
+       * obstacle avoidance - that belongs to the final development block
+       * (CODING_STANDARDS 9.1). */
+      n = path_generate_line((int16_t)lroundf(pose.x_mm),
+                             (int16_t)lroundf(pose.y_mm),
+                             cmd.x_mm, cmd.y_mm, pts, Q_PATH_CAPACITY);
+      if (n < 0)
       {
-        if ((ch == (uint8_t)'s') || (ch == (uint8_t)'S'))
+        /* Does not fit in Q_Path: refuse rather than emit a partial path that
+         * would silently stop the car in the middle of the field. */
+        rtos_stats.q_path_timeout++;
+        dbg_printf("[nav] G %d %d: path does not fit in Q_Path (%d)\r\n",
+                   (int)cmd.x_mm, (int)cmd.y_mm, n);
+        continue;
+      }
+
+      /* A new target replaces the old one entirely.  The queue is filled FIRST
+       * and the notification is raised afterwards, so the PID task can never
+       * wake up to "new path" and find Q_Path still empty (it is the higher
+       * priority of the two). */
+      (void)osMessageQueueReset(q_path);
+      path_note_generated((uint32_t)n);
+
+      for (i = 0; i < n; i++)
+      {
+        /* Producer blocks with a timeout: waypoints must not be dropped, but a
+         * stuck consumer must not hang PathGen either (CODING_STANDARDS 2.2). */
+        if (osMessageQueuePut(q_path, &pts[i], 0U, APP_Q_PATH_PUT_TMO_MS) != osOK)
         {
-          lidar_request_stop();
-          dbg_printf("\r\n[cmd] s -> stopping LiDAR (watch blk / idle)\r\n");
-        }
-        else if ((ch == (uint8_t)'g') || (ch == (uint8_t)'G'))
-        {
-          lidar_request_resume();
-          dbg_printf("\r\n[cmd] g -> restarting LiDAR\r\n");
-        }
-        else if ((ch == (uint8_t)'h') || (ch == (uint8_t)'H') || (ch == (uint8_t)'?'))
-        {
-          dbg_printf("\r\n[cmd] s = stop LiDAR, g = restart LiDAR\r\n");
-        }
-        else
-        {
-          /* ignore anything else (including the CR/LF of the terminal) */
+          path_note_put_timeout();
+          rtos_stats.q_path_timeout++;
+          put_failed = 1U;
+          break;
         }
       }
+
+      if (put_failed == 0U)
+      {
+        (void)osEventFlagsSet(evt_nav, APP_NAV_EVT_NEW_PATH);
+      }
+
+      if (put_failed != 0U)
+      {
+        dbg_printf("[nav] Q_Path full after %d/%d points, path abandoned\r\n", i, n);
+        (void)osMessageQueueReset(q_path);
+        (void)osEventFlagsSet(evt_nav, APP_NAV_EVT_STOP);
+      }
+      else
+      {
+        dbg_printf("[nav] G %d %d accepted, %d waypoints\r\n",
+                   (int)cmd.x_mm, (int)cmd.y_mm, n);
+      }
     }
+    else if (cmd.type == (uint8_t)CMD_TYPE_STOP)
+    {
+      (void)osMessageQueueReset(q_path);
+      (void)osEventFlagsSet(evt_nav, APP_NAV_EVT_STOP);
+      path_note_aborted();
+      dbg_printf("[nav] STOP: Q_Path cleared, PWM to 0\r\n");
+    }
+    else
+    {
+      /* CMD_TYPE_QUERY.  The "A G ..." / "E ..." reply belongs to the BT TX
+       * task; bt_rx.h states that wiring the replies is a later step, and this
+       * task must not print without being asked.  Nothing to do here yet. */
+    }
+  }
+}
 
-    imu_poll();
+/* ========================================================================== */
+/* Task 6: BT RX (event: UART5 semaphore)                                     */
+/* ========================================================================== */
+static void bt_rx_task(void *argument)
+{
+  (void)argument;
 
-    /* ---- 10 Hz: binary telemetry frame + one text summary -------------- */
-    if ((uint32_t)(osKernelGetTickCount() - t_frame) >= APP_FRAME_PERIOD_MS)
+  dbg_task_started("btRx", 0U, APP_PRIO_BT_RX, APP_STK_BT_RX);
+
+  for (;;)
+  {
+    /* The guard timeout also drives the "re-arm request" repair path inside
+     * bt_rx_process() when the UART reported an error (CODING_STANDARDS 5.2). */
+    (void)osSemaphoreAcquire(sem_bt_rx, APP_BT_RX_GUARD_MS);
+    (void)bt_rx_process();
+  }
+}
+
+/* ========================================================================== */
+/* Task 7: BT TX + debug console (50 ms)                                      */
+/* ========================================================================== */
+static void console_poll(void)
+{
+  uint8_t ch = 0U;
+
+  if (HAL_UART_Receive(&huart2, &ch, 1U, 0U) != HAL_OK)
+  {
+    return;
+  }
+
+  if ((ch == (uint8_t)'s') || (ch == (uint8_t)'S'))
+  {
+    lidar_request_stop();
+    dbg_printf("[cmd] s -> stopping LiDAR\r\n");
+  }
+  else if ((ch == (uint8_t)'g') || (ch == (uint8_t)'G'))
+  {
+    lidar_request_resume();
+    dbg_printf("[cmd] g -> restarting LiDAR\r\n");
+  }
+  else if ((ch == (uint8_t)'h') || (ch == (uint8_t)'H') || (ch == (uint8_t)'?'))
+  {
+    dbg_printf("[cmd] s=stop lidar g=restart lidar h=help\r\n");
+  }
+  else
+  {
+    /* ignore everything else, including terminal CR/LF */
+  }
+}
+
+static void bt_tx_task(void *argument)
+{
+  uint32_t tick = osKernelGetTickCount();
+  uint32_t slot = 0U;
+  uint32_t stats_prev_bytes = 0U;
+  uint32_t stats_prev_ms = HAL_GetTick();
+  (void)argument;
+
+  dbg_task_started("btTx", APP_PERIOD_SLOW_MS, APP_PRIO_BT_TX, APP_STK_BT_TX);
+
+  for (;;)
+  {
+    tick += APP_PERIOD_SLOW_MS;
+    timing_begin(APP_TIMING_BT_TX, APP_PERIOD_SLOW_MS * 1000U);
+
+    console_poll();
+    slot++;
+
+    /* Slot policy: odd slots carry the 10 Hz binary data frame (the PC viewer
+     * depends on that rate), even slots are free, and every 20th slot - always
+     * even, so it can never collide - carries the 1 Hz statistics frame.
+     * telemetry.c allows one UART5 transfer at a time, so a collision would
+     * silently drop one of the two frames. */
+    if ((slot % 2U) != 0U)
     {
       imu_sample_t sample;
 
-      t_frame = osKernelGetTickCount();
-
-      /* The parser task is the only writer of the 360-bin map.  A short
-       * critical section guarantees a consistent snapshot: it stops the
-       * kernel from switching back to the parser halfway through. */
+      /* The LiDAR task is the only writer of the 360-bin map; a short critical
+       * section gives a consistent snapshot (CODING_STANDARDS 1.5). */
       taskENTER_CRITICAL();
       lidar_get_scan(scan_frame, qual_frame);
       taskEXIT_CRITICAL();
 
       imu_get(&sample);
-      /* Non-blocking: if the UART5 DMA is still busy this frame is dropped and
-       * counted in telemetry_stats_t.drops. */
+      /* Non-blocking: if UART5 TX is still busy this frame is dropped and
+       * counted by telemetry.c. */
       (void)telemetry_send_data(&sample, scan_frame);
-
-      if (have_result != 0U)
-      {
-        dbg_printf("#%04u p%u ok%u nr%u iv%u n%u d[%u..%u] lat%lu p%lu "
-                   "S %u %u %u %u %u %u %u %u\r\n",
-                   (unsigned)last.block_id,
-                   (unsigned)last.packets,
-                   (unsigned)last.valid,
-                   (unsigned)last.no_return,
-                   (unsigned)last.invalid,
-                   (unsigned)last.nodes,
-                   (unsigned)last.min_mm,
-                   (unsigned)last.max_mm,
-                   (unsigned long)last.handover_us,
-                   (unsigned long)last.parse_us,
-                   (unsigned)last.sector_min_cm[0],
-                   (unsigned)last.sector_min_cm[1],
-                   (unsigned)last.sector_min_cm[2],
-                   (unsigned)last.sector_min_cm[3],
-                   (unsigned)last.sector_min_cm[4],
-                   (unsigned)last.sector_min_cm[5],
-                   (unsigned)last.sector_min_cm[6],
-                   (unsigned)last.sector_min_cm[7]);
-      }
     }
 
-    /* ---- 1 Hz: statistics --------------------------------------------- */
-    if ((uint32_t)(osKernelGetTickCount() - t_stats) >= APP_STATS_PERIOD_MS)
+    if ((slot % (APP_STATUS_PERIOD_MS / APP_PERIOD_SLOW_MS)) == 0U)
     {
-      lidar_stats_t ls;
-      imu_stats_t   is;
-      telemetry_stats_t ts;
-      app_rtos_stats_t  rs;
-      uint32_t now = HAL_GetTick();
-      uint32_t now_k = osKernelGetTickCount();
-      uint32_t span = now - prev_ms;
-      uint32_t span_k = now_k - prev_ktick;
+      static lidar_stats_t ls;
+      static imu_stats_t   is;
+      static telemetry_stats_t ts;
+      uint32_t now_ms = HAL_GetTick();
+      uint32_t span_ms = now_ms - stats_prev_ms;
       uint32_t bps;
+
+      if (span_ms == 0U)
+      {
+        span_ms = 1U;
+      }
 
       lidar_get_stats(&ls);
       imu_get_stats(&is);
       telemetry_get_stats(&ts);
-      app_rtos_get_stats(&rs);
 
-      if (span == 0U)
-      {
-        span = 1U;
-      }
-      bps = (uint32_t)(((uint64_t)(ls.bytes - prev_bytes) * 1000U) / span);
-      prev_bytes = ls.bytes;
-      prev_ms = now;
-      prev_ktick = now_k;
+      bps = (uint32_t)(((uint64_t)(ls.bytes - stats_prev_bytes) * 1000U) / span_ms);
+      stats_prev_bytes = ls.bytes;
+      stats_prev_ms = now_ms;
 
       (void)telemetry_send_stats(ts.frames, bps, &ls, &is);
-
-      dbg_printf("[1s] blk %lu/%lu q1 %lu/%u q2 %lu/%u idle %lu latmax %lu "
-                 "parsemax %lu | L %luB/s pkt %lu inv %lu nr %lu sync %lu "
-                 "slip %lu err %lu cmd %lu/%lu | IMU %lu err %lu | BT f %lu dr %lu | "
-                 "heap %lu min %lu | stk %lu/%lu | hal %lu k %lu\r\n",
-                 (unsigned long)(ls.blocks - prev_blocks),
-                 (unsigned long)ls.blocks,
-                 (unsigned long)rs.q1_peak,
-                 (unsigned)APP_Q_BLOCKS_LEN,
-                 (unsigned long)rs.q2_peak,
-                 (unsigned)APP_Q_RESULTS_LEN,
-                 (unsigned long)rs.parser_idle_wakeups,
-                 (unsigned long)rs.max_handover_us,
-                 (unsigned long)rs.max_parse_us,
-                 (unsigned long)bps,
-                 (unsigned long)ls.packets,
-                 (unsigned long)ls.invalid,
-                 (unsigned long)ls.no_return,
-                 (unsigned long)ls.syncs,
-                 (unsigned long)ls.slips,
-                 (unsigned long)ls.uart_errors,
-                 (unsigned long)ls.commands,
-                 (unsigned long)ls.stream_losses,
-                 (unsigned long)is.samples,
-                 (unsigned long)is.errors,
-                 (unsigned long)ts.frames,
-                 (unsigned long)ts.drops,
-                 (unsigned long)rs.heap_free,
-                 (unsigned long)rs.heap_min_free,
-                 (unsigned long)rs.parser_stack_free,
-                 (unsigned long)rs.output_stack_free,
-                 (unsigned long)span,
-                 (unsigned long)span_k);
-
-      prev_blocks = ls.blocks;
-      t_stats = osKernelGetTickCount();
     }
+
+    timing_end(APP_TIMING_BT_TX);
+    osDelayUntil(tick);
+    timing_check_late(APP_TIMING_BT_TX, tick, APP_PERIOD_SLOW_MS);
+  }
+}
+
+/* ========================================================================== */
+/* Task 8: OLED display + 1 Hz status block (50 ms)                           */
+/* ========================================================================== */
+static uint32_t status_prev_blocks;
+static uint32_t status_prev_ms;
+static uint32_t status_prev_samples;
+
+/* "period_ms/jitter_us/wcet_us" for one periodic task, as CODING_STANDARDS 1.3
+ * requires for EVERY periodic task (the §7 example only shows the motor one). */
+static void fmt_timing(char *dst, uint32_t dst_len, uint32_t slot)
+{
+  uint32_t per_us = timing_pub[slot].period_us_max;
+
+  (void)snprintf(dst, dst_len, "%lu.%02lu/%lu/%lu",
+                 (unsigned long)(per_us / 1000U),
+                 (unsigned long)((per_us % 1000U) / 10U),
+                 (unsigned long)timing_pub[slot].jitter_us_max,
+                 (unsigned long)timing_pub[slot].wcet_us_max);
+}
+
+static void status_line_1hz(void)
+{
+  static lidar_stats_t   ls;
+  static imu_stats_t     is;
+  static i2c_bus_stats_t bs;
+  static bt_rx_stats_t   br;
+  static path_stats_t    ps;
+  static log_stats_t     lg;
+  static app_rtos_stats_t rs;
+  pose_t p;
+
+  uint32_t now_ms = HAL_GetTick();
+  uint32_t span_ms = now_ms - status_prev_ms;
+  uint32_t blk = 0U;
+  uint32_t imu_hz = 0U;
+  uint32_t hold_us;
+  uint32_t per_us;
+  int32_t  h10;
+
+  if (span_ms == 0U)
+  {
+    span_ms = 1U;
+  }
+
+  lidar_get_stats(&ls);
+  imu_get_stats(&is);
+  i2c_bus_get_stats(&bs);
+  bt_rx_get_stats(&br);
+  path_get_stats(&ps);
+  log_get_stats(&lg);
+  app_rtos_get_stats(&rs);
+  pose_get(&p);
+
+  blk = (uint32_t)(((uint64_t)(ls.blocks - status_prev_blocks) * 1000U) / span_ms);
+  status_prev_blocks = ls.blocks;
+
+  /* CODING_STANDARDS 2.5: the IMU sample rate must be measurable (~100 Hz).
+   * Measured as a delta, never assumed. */
+  imu_hz = (uint32_t)(((uint64_t)(is.samples - status_prev_samples) * 1000U) / span_ms);
+  status_prev_samples = is.samples;
+
+  status_prev_ms = now_ms;
+
+  /* ---- line 1: LiDAR, motor task, Q_Cmd -------------------------------- */
+  per_us = rs.timing[APP_TIMING_PID_MOTOR].period_us_max;
+  dbg_printf("[1s] L: blk%lu q%lu/%u p%lu | M: per%lu.%02lu jit%lu wc%lu | C: q%lu/%u\r\n",
+             (unsigned long)blk,
+             (unsigned long)rs.q_lidar_peak,
+             (unsigned)APP_Q_LIDAR_LEN,
+             (unsigned long)rs.max_parse_us,
+             (unsigned long)(per_us / 1000U),
+             (unsigned long)((per_us % 1000U) / 10U),
+             (unsigned long)rs.timing[APP_TIMING_PID_MOTOR].jitter_us_max,
+             (unsigned long)rs.timing[APP_TIMING_PID_MOTOR].wcet_us_max,
+             (unsigned long)osMessageQueueGetCount(q_cmd),
+             (unsigned)APP_Q_CMD_LEN);
+
+  /* ---- line 2: pose, Q_Path, path progress ----------------------------- */
+  h10 = (int32_t)lroundf(p.heading_deg * 10.0f);
+  dbg_printf("[1s] P: eh%ld.%ld ex%ld ey%ld | QP: %lu | PATH: g%lu r%lu\r\n",
+             (long)(h10 / 10),
+             (long)((h10 % 10 < 0) ? -(h10 % 10) : (h10 % 10)),
+             (long)lroundf(p.x_mm),
+             (long)lroundf(p.y_mm),
+             (unsigned long)osMessageQueueGetCount(q_path),
+             (unsigned long)ps.generated,
+             (unsigned long)ps.reached);
+
+  /* ---- line 3: I2C, heap, watchdog, IMU rate --------------------------- */
+  hold_us = bs.hold_us_max;
+  dbg_printf("[1s] I2C: ok%lu err%lu hold%lu.%lums | H: %lu/%u | WD: %u | IMU: %lu/s\r\n",
+             (unsigned long)bs.ok,
+             (unsigned long)bs.err,
+             (unsigned long)(hold_us / 1000U),
+             (unsigned long)((hold_us % 1000U) / 100U),
+             (unsigned long)rs.heap_free,
+             (unsigned)rs.heap_total,
+             (unsigned)0U,   /* IWDG is not enabled yet - see HANDOVER "待上板" */
+             (unsigned long)imu_hz);
+
+  /* ---- line 4: stacks, in the documented order ------------------------- */
+  dbg_printf("[1s] STK: %lu %lu %lu %lu %lu %lu %lu %lu\r\n",
+             (unsigned long)rs.stack_free[APP_TASK_PID_MOTOR],
+             (unsigned long)rs.stack_free[APP_TASK_IMU],
+             (unsigned long)rs.stack_free[APP_TASK_POSE],
+             (unsigned long)rs.stack_free[APP_TASK_LIDAR],
+             (unsigned long)rs.stack_free[APP_TASK_PATH],
+             (unsigned long)rs.stack_free[APP_TASK_BT_RX],
+             (unsigned long)rs.stack_free[APP_TASK_BT_TX],
+             (unsigned long)rs.stack_free[APP_TASK_OLED]);
+
+  /* ---- line 5+6: timing of all four periodic tasks (1.3) --------------- */
+  {
+    char t_motor[32];
+    char t_pose[32];
+    char t_bttx[32];
+    char t_oled[32];
+
+    fmt_timing(t_motor, sizeof(t_motor), APP_TIMING_PID_MOTOR);
+    fmt_timing(t_pose, sizeof(t_pose), APP_TIMING_POSE);
+    fmt_timing(t_bttx, sizeof(t_bttx), APP_TIMING_BT_TX);
+    fmt_timing(t_oled, sizeof(t_oled), APP_TIMING_OLED);
+
+    /* format per row: <key>period_ms/jitter_us/wcet_us */
+    dbg_printf("[1s] T10: m%s p%s | ov m%lu p%lu\r\n",
+               t_motor, t_pose,
+               (unsigned long)rs.timing[APP_TIMING_PID_MOTOR].overruns,
+               (unsigned long)rs.timing[APP_TIMING_POSE].overruns);
+
+    dbg_printf("[1s] T50: b%s o%s | ov b%lu o%lu\r\n",
+               t_bttx, t_oled,
+               (unsigned long)rs.timing[APP_TIMING_BT_TX].overruns,
+               (unsigned long)rs.timing[APP_TIMING_OLED].overruns);
+  }
+
+  /* ---- line 7: the failure counters CODING_STANDARDS 5.5 requires ------ */
+  dbg_printf("[1s] CNT: ql%lu qc%lu qpt%lu imu%lu bt(s%lu r%lu o%lu u%lu) log%lu imu2%lu\r\n",
+             (unsigned long)rs.blocks_dropped,
+             (unsigned long)rs.q_cmd_overwrite,
+             (unsigned long)rs.q_path_timeout,
+             (unsigned long)rs.imu_ticks_unused,
+             (unsigned long)br.syntax_err,
+             (unsigned long)br.range_err,
+             (unsigned long)br.overlong,
+             (unsigned long)br.uart_errors,
+             (unsigned long)lg.drops,
+             (unsigned long)rs.imu_wait_timeouts);
+}
+
+static void oled_task(void *argument)
+{
+  uint32_t tick = osKernelGetTickCount();
+  uint32_t slot = 0U;
+  (void)argument;
+
+  dbg_task_started("oled", APP_PERIOD_SLOW_MS, APP_PRIO_OLED, APP_STK_OLED);
+
+  for (;;)
+  {
+    uint8_t page = 0U;
+    pose_t p;
+    i2c_bus_stats_t bs;
+
+    tick += APP_PERIOD_SLOW_MS;
+    timing_begin(APP_TIMING_OLED, APP_PERIOD_SLOW_MS * 1000U);
+
+    pose_get(&p);
+    i2c_bus_get_stats(&bs);
+
+    /* One page per slot: 8 slots = 400 ms for a full frame, which is why the
+     * content must be a status screen and not a live trace. */
+    oled_row(0U, "PART2 NAV v0.3");
+    oled_row(1U, "X%6ld Y%6ld", (long)lroundf(p.x_mm), (long)lroundf(p.y_mm));
+    oled_row(2U, "H%6ld QP%3lu", (long)lroundf(p.heading_deg),
+             (unsigned long)osMessageQueueGetCount(q_path));
+    oled_row(3U, "CQ%2lu LQ%2lu", (unsigned long)osMessageQueueGetCount(q_cmd),
+             (unsigned long)osMessageQueueGetCount(q_lidar));
+    oled_row(4U, "I2C ok%lu e%lu", (unsigned long)bs.ok, (unsigned long)bs.err);
+    oled_row(5U, "OLED %s", (oled_is_present() != 0U) ? "ok" : "absent");
+    oled_row(6U, "H src %s", (p.heading_src == 0U) ? "gyro" : "wheel");
+    oled_row(7U, "t%lu s%lu", (unsigned long)osKernelGetTickCount(),
+             (unsigned long)slot);
+
+    /* A missing panel is not an error here: oled.c returns OLED_ERR_ABSENT and
+     * the framebuffer stays usable, so the display code is identical either way. */
+    (void)oled_refresh_next(&page);
+
+    slot++;
+
+    if ((slot % (APP_STATUS_PERIOD_MS / APP_PERIOD_SLOW_MS)) == 0U)
+    {
+      status_line_1hz();
+    }
+
+    timing_end(APP_TIMING_OLED);
+    osDelayUntil(tick);
+    timing_check_late(APP_TIMING_OLED, tick, APP_PERIOD_SLOW_MS);
   }
 }
 
 /* ========================================================================== */
 /* init / start                                                               */
 /* ========================================================================== */
-
 void app_rtos_init(void)
 {
   memset(&rtos_stats, 0, sizeof(rtos_stats));
+  memset(timing_int, 0, sizeof(timing_int));
+  memset(timing_pub, 0, sizeof(timing_pub));
 
   if (osKernelInitialize() != osOK)
   {
     Error_Handler();
   }
 
-  /* Queue 1: small block descriptors, ISR -> parser. */
-  q_blocks = osMessageQueueNew(APP_Q_BLOCKS_LEN, sizeof(lidar_block_desc_t), &q_blocks_attr);
-  /* Queue 2: processed results, parser -> output. */
-  q_results = osMessageQueueNew(APP_Q_RESULTS_LEN, sizeof(lidar_result_t), &q_results_attr);
+  q_lidar = osMessageQueueNew(APP_Q_LIDAR_LEN, sizeof(lidar_block_desc_t), &q_lidar_attr);
+  q_cmd   = osMessageQueueNew(APP_Q_CMD_LEN, sizeof(cmd_msg_t), &q_cmd_attr);
+  q_path  = osMessageQueueNew(APP_Q_PATH_LEN, sizeof(path_point_t), &q_path_attr);
 
-  if ((q_blocks == NULL) || (q_results == NULL))
+  sem_imu   = osSemaphoreNew(APP_IMU_SEM_MAX, 0U, &sem_imu_attr);
+  sem_bt_rx = osSemaphoreNew(APP_BT_RX_SEM_MAX, 0U, &sem_bt_attr);
+
+  evt_nav = osEventFlagsNew(&evt_nav_attr);
+
+  if ((q_lidar == NULL) || (q_cmd == NULL) || (q_path == NULL) ||
+      (sem_imu == NULL) || (sem_bt_rx == NULL) || (evt_nav == NULL))
   {
     Error_Handler();
   }
 
-  t_parser = osThreadNew(parser_task, NULL, &parser_attr);
-  t_output = osThreadNew(output_task, NULL, &output_attr);
+  t_pid  = osThreadNew(pid_motor_task, NULL, &pid_motor_attr);
+  t_imu  = osThreadNew(imu_task, NULL, &imu_attr);
+  t_pose = osThreadNew(pose_task, NULL, &pose_attr);
+  t_lidar = osThreadNew(lidar_task, NULL, &lidar_attr);
+  t_path = osThreadNew(path_task, NULL, &path_attr);
+  t_bt_rx = osThreadNew(bt_rx_task, NULL, &bt_rx_attr);
+  t_bt_tx = osThreadNew(bt_tx_task, NULL, &bt_tx_attr);
+  t_oled = osThreadNew(oled_task, NULL, &oled_attr);
 
-  if ((t_parser == NULL) || (t_output == NULL))
+  if ((t_pid == NULL) || (t_imu == NULL) || (t_pose == NULL) || (t_lidar == NULL) ||
+      (t_path == NULL) || (t_bt_rx == NULL) || (t_bt_tx == NULL) || (t_oled == NULL))
   {
     Error_Handler();
   }
+
+  /* The queue-ownership policy lives next to the queue: bt_rx only knows it has
+   * a sink to call (bt_rx.h). */
+  bt_rx_set_sink(cmd_sink);
 }
 
 void app_rtos_start(void)
 {
   if (osKernelStart() != osOK)
   {
-    /* The scheduler must never return. */
     Error_Handler();
   }
 }
 
 void app_rtos_get_stats(app_rtos_stats_t *out)
 {
-  memset(out, 0, sizeof(*out));
-  *out = rtos_stats;
+  osThreadId_t ids[APP_TASK_COUNT];
+  uint32_t i;
 
+  if (out == NULL)
+  {
+    return;
+  }
+
+  ids[APP_TASK_PID_MOTOR] = t_pid;
+  ids[APP_TASK_IMU]       = t_imu;
+  ids[APP_TASK_POSE]      = t_pose;
+  ids[APP_TASK_LIDAR]     = t_lidar;
+  ids[APP_TASK_PATH]      = t_path;
+  ids[APP_TASK_BT_RX]     = t_bt_rx;
+  ids[APP_TASK_BT_TX]     = t_bt_tx;
+  ids[APP_TASK_OLED]      = t_oled;
+
+  /* Copy the counters under a short critical section so a 1 Hz snapshot cannot
+   * mix two different moments (memory only, no calls inside - 1.5). */
+  taskENTER_CRITICAL();
+  memcpy(out, &rtos_stats, sizeof(*out));
+  memcpy(out->timing, timing_pub, sizeof(timing_pub));
+  taskEXIT_CRITICAL();
+
+  out->heap_total = (uint32_t)configTOTAL_HEAP_SIZE;
   out->heap_free = (uint32_t)xPortGetFreeHeapSize();
   out->heap_min_free = (uint32_t)xPortGetMinimumEverFreeHeapSize();
 
-  if (t_parser != NULL)
+  for (i = 0U; i < APP_TASK_COUNT; i++)
   {
-    out->parser_stack_free =
-        (uint32_t)uxTaskGetStackHighWaterMark((TaskHandle_t)t_parser) * sizeof(StackType_t);
-  }
-  if (t_output != NULL)
-  {
-    out->output_stack_free =
-        (uint32_t)uxTaskGetStackHighWaterMark((TaskHandle_t)t_output) * sizeof(StackType_t);
+    out->stack_free[i] = (ids[i] != NULL)
+        ? (uint32_t)uxTaskGetStackHighWaterMark((TaskHandle_t)ids[i]) * sizeof(StackType_t)
+        : 0U;
   }
 }
 
 /* ========================================================================== */
 /* FreeRTOS hooks                                                             */
 /* ========================================================================== */
-
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 {
   (void)xTask;

@@ -22,6 +22,8 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "bt_rx.h"
+#include "log.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -191,6 +193,31 @@ void DMA1_Stream1_IRQHandler(void)
   /* USER CODE BEGIN DMA1_Stream1_IRQn 1 */
 
   /* USER CODE END DMA1_Stream1_IRQn 1 */
+}
+
+/**
+  * @brief This function handles DMA1 stream0 global interrupt.
+  *
+  * UART5 RX (Bluetooth command channel), DMA1_Stream0 channel 4 - see
+  * board_pins.h section 6.  The handle is private to bt_rx.c, so the ISR
+  * delegates instead of touching it.  Priority 5, set in bt_rx_init() and
+  * re-asserted by app_init(): the readout eventually wakes the BT RX task.
+  */
+void DMA1_Stream0_IRQHandler(void)
+{
+  bt_rx_dma_irq_handler();
+}
+
+/**
+  * @brief This function handles DMA1 stream6 global interrupt.
+  *
+  * USART2 TX (debug console), DMA1_Stream6 channel 4.  The handle is private to
+  * log.c, so the ISR delegates.  Priority 6: the completion path calls no RTOS
+  * API, but it must not preempt a kernel critical section.
+  */
+void DMA1_Stream6_IRQHandler(void)
+{
+  log_dma_irq_handler();
 }
 
 /**

@@ -1,11 +1,41 @@
+/* -----------------------------------------------------------------------------
+ * imu.c - MPU-6500 on I2C1, sampled from TASK context.
+ *
+ * WHAT CHANGED IN PHASE C (and why)
+ * ---------------------------------
+ * Before: the TIM6 100 Hz interrupt issued HAL_I2C_Mem_Read_IT() and the result
+ * was integrated in HAL_I2C_MemRxCpltCallback.  That is exactly what
+ * CODING_STANDARDS 0.4 forbids - an ISR starting a bus transaction and a second
+ * ISR doing the maths - and it made the shared-bus mutex impossible to hold
+ * across the transfer, because an interrupt cannot own a mutex.
+ *
+ * Now: TIM6 releases a counting semaphore; the IMU task acquires it and calls
+ * imu_sample_once(), which performs one blocking-but-bounded read through
+ * i2c_bus_mem_read() (mutex held for the whole transaction) and integrates the
+ * heading in the same task context.  No HAL I2C call remains in this file's
+ * interrupt path; the only ISR work left is "count the tick, release the
+ * semaphore".
+ *
+ * The TIM6 HAL callback stays in this file because it belongs to the sampling
+ * cadence, but it does not touch the bus any more - it calls
+ * app_rtos_imu_tick(), which is a bare osSemaphoreRelease().
+ *
+ * HEADING INTEGRATION: dt comes from DWT (not from the nominal 10 ms) so a
+ * late task or a preempted sample does not skew the gyro integration.  dt is
+ * clamped to 200 ms so a long stall (debugger, bus recovery) cannot produce a
+ * huge heading jump; that clamp is a deliberate, visible approximation.
+ * -------------------------------------------------------------------------- */
+
 #include "imu.h"
-#include "main.h"
+#include "app_rtos.h"
+#include "board_pins.h"
+#include "i2c_bus.h"
+
 #include <string.h>
 
-extern I2C_HandleTypeDef hi2c1;
 extern TIM_HandleTypeDef htim6;
 
-#define IMU_ADDR       (0x68U << 1)
+#define IMU_ADDR7      BOARD_IMU_I2C_ADDR_7BIT
 #define IMU_WHO_AM_I   0x75U
 #define IMU_PWR_MGMT_1 0x6BU
 #define IMU_CONFIG     0x1AU
@@ -15,178 +45,115 @@ extern TIM_HandleTypeDef htim6;
 #define IMU_GYRO_SENS  131.0f
 #define IMU_ACCEL_SENS 16384.0f
 
-static uint8_t raw[14];
-static volatile uint8_t busy;
-static volatile uint32_t busy_since;
+/* Bounded per CODING_STANDARDS 5.1: one sample must never wait on the bus for
+ * longer than this, whatever the panel is doing. */
+#define IMU_TXN_TMO_MS 10U
+
+/* dt clamp for the gyro integration (see the header comment). */
+#define IMU_DT_MAX_S   0.2f
+
 static uint32_t last_cycles;
 static uint32_t last_ms;
-static float bias_gz;
-static float heading_deg;
-static float gz_dps;
-static float ax_g;
-static float ay_g;
+static float    bias_gz;
+static float    heading_deg;
+static float    gz_dps;
+static float    ax_g;
+static float    ay_g;
 static imu_stats_t stats;
-static uint8_t imu_present;
-static volatile uint8_t need_recover;
-static uint8_t busy_ticks;
+static uint8_t  imu_present;
+
 uint32_t imu_diag_status;
 uint32_t imu_diag_err;
 uint32_t imu_diag_who;
-
-static void delay_us(uint32_t us)
-{
-  uint32_t t0 = DWT->CYCCNT;
-  uint32_t n = us * (SystemCoreClock / 1000000U);
-  while ((DWT->CYCCNT - t0) < n)
-  {
-  }
-}
-
-static void i2c_bus_recover(void)
-{
-  GPIO_InitTypeDef g = {0};
-
-  HAL_I2C_DeInit(&hi2c1);
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_SET);
-  g.Pin = GPIO_PIN_8 | GPIO_PIN_9;
-  g.Mode = GPIO_MODE_OUTPUT_OD;
-  g.Pull = GPIO_PULLUP;
-  g.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &g);
-  delay_us(10U);
-
-  for (uint8_t i = 0U; i < 9U; i++)
-  {
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
-    delay_us(10U);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
-    delay_us(10U);
-  }
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
-  delay_us(10U);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
-  delay_us(10U);
-
-  __HAL_RCC_I2C1_FORCE_RESET();
-  __HAL_RCC_I2C1_RELEASE_RESET();
-  hi2c1.Init.ClockSpeed = 50000U;
-  HAL_I2C_Init(&hi2c1);
-  g.Pin = GPIO_PIN_8 | GPIO_PIN_9;
-  g.Mode = GPIO_MODE_AF_OD;
-  g.Pull = GPIO_PULLUP;
-  g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  g.Alternate = GPIO_AF4_I2C1;
-  HAL_GPIO_Init(GPIOB, &g);
-  /* Keep the I2C ISRs at the same priority the RTOS layer defines (6).  These
-   * ISRs never call FreeRTOS API, but they must NOT sit above
-   * configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY (5): an interrupt that can
-   * preempt a kernel critical section must not be able to touch RTOS objects. */
-  HAL_NVIC_SetPriority(I2C1_EV_IRQn, 6U, 0U);
-  HAL_NVIC_SetPriority(I2C1_ER_IRQn, 6U, 0U);
-  stats.recoveries++;
-}
-
-void imu_poll(void)
-{
-  if ((need_recover != 0U) && (imu_present != 0U))
-  {
-    i2c_bus_recover();
-    busy = 0U;
-    busy_ticks = 0U;
-    need_recover = 0U;
-  }
-}
-
-static HAL_StatusTypeDef imu_wr(uint8_t reg, uint8_t val)
-{
-  return HAL_I2C_Mem_Write(&hi2c1, IMU_ADDR, reg, I2C_MEMADD_SIZE_8BIT, &val, 1U, 100U);
-}
-
-static HAL_StatusTypeDef imu_rd(uint8_t reg, uint8_t *buf, uint16_t len)
-{
-  return HAL_I2C_Mem_Read(&hi2c1, IMU_ADDR, reg, I2C_MEMADD_SIZE_8BIT, buf, len, 100U);
-}
 
 static int16_t be16(const uint8_t *p)
 {
   return (int16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 
+static int imu_wr(uint8_t reg, uint8_t val)
+{
+  return (i2c_bus_mem_write(IMU_ADDR7, reg, &val, 1U, IMU_TXN_TMO_MS) == I2C_BUS_OK) ? 0 : -1;
+}
+
+static int imu_rd(uint8_t reg, uint8_t *buf, uint16_t len)
+{
+  return (i2c_bus_mem_read(IMU_ADDR7, reg, buf, len, IMU_TXN_TMO_MS) == I2C_BUS_OK) ? 0 : -1;
+}
+
+/* ========================================================================== */
+/* init (boot context, scheduler not running yet)                             */
+/* ========================================================================== */
 int imu_init(void)
 {
   uint8_t who = 0U;
   uint8_t ok = 0U;
+  uint8_t raw[14];
 
   imu_present = 0U;
+
   for (uint8_t attempt = 0U; attempt < 5U; attempt++)
   {
-    HAL_StatusTypeDef st;
-    i2c_bus_recover();
     who = 0U;
-    st = imu_rd(IMU_WHO_AM_I, &who, 1U);
-    imu_diag_status = (uint32_t)st;
-    imu_diag_err = hi2c1.ErrorCode;
+    imu_diag_status = (uint32_t)imu_rd(IMU_WHO_AM_I, &who, 1U);
     imu_diag_who = who;
-    if ((st == HAL_OK) &&
+
+    if ((imu_diag_status == 0U) &&
         ((who == 0x70U) || (who == 0x71U) || (who == 0x73U)))
     {
       ok = 1U;
       break;
     }
+
+    /* Boot only (no scheduler yet), so a blocking delay is acceptable here and
+     * nowhere else in this file. */
     HAL_Delay(20U);
   }
+
   if (ok == 0U)
   {
     return (who == 0U) ? -1 : -2;
   }
 
-  if (imu_wr(IMU_PWR_MGMT_1, 0x80U) != HAL_OK)
-  {
-    return -3;
-  }
+  if (imu_wr(IMU_PWR_MGMT_1, 0x80U) != 0) { return -3; }   /* reset            */
   HAL_Delay(100U);
-  if (imu_wr(IMU_PWR_MGMT_1, 0x01U) != HAL_OK)
-  {
-    return -4;
-  }
-  if (imu_wr(IMU_CONFIG, 0x03U) != HAL_OK)
-  {
-    return -5;
-  }
-  if (imu_wr(IMU_GYRO_CFG, 0x00U) != HAL_OK)
-  {
-    return -6;
-  }
-  if (imu_wr(IMU_ACCEL_CFG, 0x00U) != HAL_OK)
-  {
-    return -7;
-  }
+  if (imu_wr(IMU_PWR_MGMT_1, 0x01U) != 0) { return -4; }   /* clock = PLL      */
+  if (imu_wr(IMU_CONFIG, 0x03U) != 0)     { return -5; }   /* DLPF             */
+  if (imu_wr(IMU_GYRO_CFG, 0x00U) != 0)   { return -6; }   /* +-250 dps        */
+  if (imu_wr(IMU_ACCEL_CFG, 0x00U) != 0)  { return -7; }   /* +-2 g            */
   HAL_Delay(50U);
 
-  float accum = 0.0f;
-  uint16_t n = 0U;
-  for (uint16_t i = 0U; i < 200U; i++)
+  /* Gyro zero bias: the car must stand still during boot.  200 samples at
+   * 10 ms = 2 s.  This is a boot-time calibration, not a measurement result. */
   {
-    if (imu_rd(IMU_ACCEL_XOUT, raw, 14U) == HAL_OK)
+    float accum = 0.0f;
+    uint16_t n = 0U;
+
+    for (uint16_t i = 0U; i < 200U; i++)
     {
-      accum += (float)be16(&raw[12]);
-      n++;
+      if (imu_rd(IMU_ACCEL_XOUT, raw, 14U) == 0)
+      {
+        accum += (float)be16(&raw[12]);
+        n++;
+      }
+      HAL_Delay(10U);
     }
-    HAL_Delay(10U);
+    bias_gz = (n > 0U) ? ((accum / (float)n) / IMU_GYRO_SENS) : 0.0f;
   }
-  bias_gz = (n > 0U) ? ((accum / (float)n) / IMU_GYRO_SENS) : 0.0f;
 
   heading_deg = 0.0f;
   gz_dps = 0.0f;
   ax_g = 0.0f;
   ay_g = 0.0f;
-  busy = 0U;
+  last_cycles = DWT->CYCCNT;
+  last_ms = HAL_GetTick();
+
   {
     uint32_t keep = stats.recoveries;
     memset(&stats, 0, sizeof(stats));
     stats.recoveries = keep;
   }
+
   imu_present = 1U;
   return 0;
 }
@@ -199,6 +166,9 @@ void imu_start(void)
   }
   last_cycles = DWT->CYCCNT;
   last_ms = HAL_GetTick();
+
+  /* TIM6 is the 10 ms cadence source.  Its ISR now only releases the semaphore
+   * that wakes the IMU task (see HAL_TIM_PeriodElapsedCallback below). */
   HAL_TIM_Base_Start_IT(&htim6);
 }
 
@@ -207,13 +177,8 @@ void imu_reset_heading(void)
   heading_deg = 0.0f;
 }
 
-void imu_on_error(void)
-{
-  busy = 0U;
-  stats.errors++;
-  need_recover = 1U;
-}
-
+/* Interrupt context: count the tick and hand one credit to the IMU task.
+ * No bus access, no parsing, no integration (CODING_STANDARDS 0.4). */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance != TIM6)
@@ -223,63 +188,58 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
   stats.ticks++;
 
-  if (need_recover != 0U)
+  if (app_rtos_imu_tick() != 0)
   {
+    /* The previous tick had not been consumed yet: the semaphore was full.
+     * That is the "IMU task fell behind" signal and must be visible. */
     stats.skipped++;
-    return;
-  }
-
-  if (busy != 0U)
-  {
-    busy_ticks++;
-    if (busy_ticks > 2U)
-    {
-      busy = 0U;
-      busy_ticks = 0U;
-      stats.errors++;
-      need_recover = 1U;
-    }
-    else
-    {
-      stats.skipped++;
-    }
-    return;
-  }
-
-  if (__HAL_I2C_GET_FLAG(&hi2c1, I2C_FLAG_BUSY) != RESET)
-  {
-    stats.errors++;
-    need_recover = 1U;
-    return;
-  }
-  busy = 1U;
-  busy_ticks = 0U;
-  busy_since = HAL_GetTick();
-  if (HAL_I2C_Mem_Read_IT(&hi2c1, IMU_ADDR, IMU_ACCEL_XOUT, I2C_MEMADD_SIZE_8BIT, raw, 14U) != HAL_OK)
-  {
-    busy = 0U;
-    stats.errors++;
-    need_recover = 1U;
   }
 }
 
-void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
+void imu_on_error(void)
 {
-  if (hi2c->Instance != I2C1)
+  /* Called from HAL_I2C_ErrorCallback, i.e. interrupt context.  The synchronous
+   * transfer API already reports the failure through its return value, and the
+   * bus recovery must run in task context, so all this does is count. */
+  stats.errors++;
+}
+
+/* ========================================================================== */
+/* task context                                                               */
+/* ========================================================================== */
+int imu_sample_once(void)
+{
+  uint8_t raw[14];
+  int16_t axr;
+  int16_t ayr;
+  int16_t gzr;
+  uint32_t now;
+  float dt;
+
+  if (imu_present == 0U)
   {
-    return;
+    return -1;
   }
 
-  int16_t axr = be16(&raw[0]);
-  int16_t ayr = be16(&raw[2]);
-  int16_t gzr = be16(&raw[12]);
-
-  uint32_t now = DWT->CYCCNT;
-  float dt = (float)(now - last_cycles) / (float)SystemCoreClock;
-  last_cycles = now;
-  if (dt > 0.2f)
+  if (imu_rd(IMU_ACCEL_XOUT, raw, 14U) != 0)
   {
-    dt = 0.2f;
+    /* i2c_bus_* already counted the error and triggers bus recovery after
+     * repeated real failures.  Nothing to repair here. */
+    stats.errors++;
+    return -2;
+  }
+
+  axr = be16(&raw[0]);
+  ayr = be16(&raw[2]);
+  gzr = be16(&raw[12]);
+
+  now = DWT->CYCCNT;
+  dt = (float)(uint32_t)(now - last_cycles) / (float)SystemCoreClock;
+  last_cycles = now;
+
+  if (dt > IMU_DT_MAX_S)
+  {
+    dt = IMU_DT_MAX_S;
   }
 
   ax_g = (float)axr / IMU_ACCEL_SENS;
@@ -302,11 +262,15 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
   }
   stats.samples++;
   last_ms = HAL_GetTick();
-  busy = 0U;
+  return 0;
 }
 
 void imu_get(imu_sample_t *out)
 {
+  if (out == NULL)
+  {
+    return;
+  }
   out->heading_deg = heading_deg;
   out->gz_dps = gz_dps;
   out->ax_g = ax_g;
@@ -316,5 +280,9 @@ void imu_get(imu_sample_t *out)
 
 void imu_get_stats(imu_stats_t *out)
 {
-  memcpy(out, &stats, sizeof(stats));
+  if (out == NULL)
+  {
+    return;
+  }
+  memcpy(out, &stats, sizeof(*out));
 }

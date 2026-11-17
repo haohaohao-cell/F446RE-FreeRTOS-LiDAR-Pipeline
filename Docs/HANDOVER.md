@@ -8,8 +8,8 @@
 ## 一、当前状态一句话
 
 **旧任务（LiDAR 流水线）已完成、上板实测通过、已上 GitHub。**
-**但课程把任务改版了**：现在是 Part 1（周一交，纸面分析）+ Part 2（周五交，整车自主导航）。
-Part 2 的工作量远大于旧任务，尚未开始。
+**课程改版为 Part 1 + Part 2。Part 1 已完成；Part 2 的 Phase B（硬件层）与 Phase C（RTOS 骨架/8 线程）已完成代码，编译 0 warning / 0 error，但除旧任务已验证的部分外，全部未上板。**
+详见 §十一（Phase B/C 实现记录）与 §七（待实测清单）。
 
 ---
 
@@ -187,21 +187,20 @@ NVIC 优先级，**后写者赢**。只要有一个在 5 之下，LiDAR 中断�
 
 ### Part 2（周五，主要工作量）
 
-- [x] 移植硬件层（**仅 motor + encoder，0 warning 编译通过，未上板**）：`motor.c`（TIM4+TIM2 PWM、PID）、`encoder.c`（TIM1/TIM8 x4，1320 counts/rev）
-- [ ] `Oled.c` 移植（传输层要从软 I2C 换成 I2C1 + 互斥量；**等 §7.1 的 OLED 型号实测结果**，当前只有接口）
-- [ ] 解决引脚/定时器冲突（已定：PB6/PB7 = 左轮 TIM4，PA0/PA1 = 右轮 TIM2 假设值；OLED 从 PB0/PA4 移到 I2C1）
-- [ ] 蓝牙**接收** + 命令解析 → `Q_Cmd`（`bt_protocol.h` 接口已定，实现待写）
-- [ ] 路径生成 → `Q_Path`（步长由团队定）
-- [ ] 里程计（编码器 → 位姿）
-- [ ] IMU 改成 **信号量**驱动（TIM6 10 ms ISR → 任务）
-- [ ] **I2C 互斥量 + 优先级继承**（MPU6500 + OLED）
-- [x] **接口已定**：`Core/Inc/i2c_bus.h`（I2C1 共享总线 + 互斥量唯一所有者）、
-      `Core/Inc/oled.h`（显存/绘图 + 单页刷新 + 传输缝）、
-      `Core/Inc/bt_rx.h`（IDLE 行检测 + 环形缓冲 + sink 回调）——实现 .c 待写
-- [ ] PID 路径跟踪任务（10 ms）
-- [ ] OLED 接入并挂到 **I2C1**（与 IMU 同总线）
-- [ ] 任务架构重整（**8 个线程**，见 `CODING_STANDARDS.md` §1.2 与 10→8 映射表）
+- [x] 移植硬件层（**motor + encoder + tim_cal，0 warning 编译通过，未上板**）：`motor.c`（TIM4+TIM2 PWM、PID）、`encoder.c`（TIM1/TIM8 x4，1320 counts/rev）
+- [x] **OLED 驱动**（`oled.c`，128x64 SSD1306，走 I2C1 + 互斥量，按页刷新；6x8 字库在 `oled_font.c`，已离线渲染核对全部 95 个字符）
+- [x] 引脚/定时器冲突（PB6/PB7 = 左轮 TIM4，PA0/PA1 = 右轮 TIM2 假设值；OLED 从 PB0/PA4 移到 I2C1）
+- [x] **蓝牙接收 + 命令解析**（`bt_rx.c` DMA1_Stream0 + IDLE 行检测 + 环形缓冲；`bt_protocol.c` 的 `bt_parse_line()`/`bt_error_text()`，46 条主机侧单元测试全通过）
+- [x] 路径生成 → `Q_Path`（`path.c`：直线路点生成 + 航向控制律，参数**待整定**）
+- [x] 里程计（编码器 → 位姿，`pose.c`；18 条主机侧单元测试通过，**标定常数未实测**）
+- [x] IMU 改成 **信号量**驱动（TIM6 10 ms ISR 只 `osSemaphoreRelease`，采样搬到 IMU 任务上下文）
+- [x] **I2C 互斥量 + 优先级继承**（`i2c_bus.c`：`osMutexPrioInherit`、有界事务、重试、恢复、DWT 实测持锁时间）
+- [x] **8 个线程**任务架构（`app_rtos.c`，见 §十一）+ 三个队列 + 事件标志
+- [x] 1 Hz 状态行（7 行固定格式，见 §十一.6；无实测数据的字段标 0 并在启动横幅说明）
+- [ ] **上板验证**（见 §七.1；这是现在唯一剩下的硬工作量）
 - [ ] 三次导航实测 + 端点/航向误差记录
+- [ ] 蓝牙下行回复 `A G x y` / `E code text`（`bt_protocol.h` 已定义格式，BT TX 侧尚未接线）
+- [ ] IWDG（超时 1 s + 健康位门控喂狗，规范 §5.3；当前 `WD: 0` 明确表示未启用）
 - [ ] 重写报告/README/演示材料（现在都是旧任务的）
 
 ---
@@ -214,12 +213,20 @@ NVIC 优先级，**后写者赢**。只要有一个在 5 之下，LiDAR 中断�
 ### 7.1 必须实测（硬件，今晚量）
 
 - [ ] **[待实测] OLED 型号**：拆模块背面看丝印 —— 4 针 `GND VCC SCL SDA` = I2C 版 SSD1306（地址 0x3C，少数 0x3D 有跳线）；7 针 `GND VCC D0 D1 RES DC CS` = **SPI 版，方案要改，立刻上报**。供电 **必须 3.3 V**（5 V 会把 SCL/SDA 上拉拉到 5 V）。
+- [ ] **[待实测] OLED 是否应答**：启动横幅 `oled=` 字段。`0` 或有面板；`-3` = 地址不该 NACK（没插/地址不对）；`-1` = 总线错误。面板缺席时程序**照常运行**，只是不刷新。
+- [ ] **[待实测] 1 Hz 行里 `I2C: hold` 的真实值**：这是 `i2c_bus` 用 DWT 实测的最长持锁时间。规范目标是 < 3 ms；OLED 一页按 32 字节分块传输，按 100 kHz 推算约 2.97 ms/块，**必须用实测值确认**（推算值不算数）。
+- [ ] **[待实测] OLED 一页刷新的实际耗时**：`[1s] T50: o<per>/<jit>/<wc>` 的第三个数字就是 OLED 任务 WCET。按推算一页约 11–12 ms，**超出 §1.2 给的 3 ms 预算**；因为 OLED 是最低优先级，不影响控制环，但报告里必须写实测值 + 说明（或把 I2C 提到 400 kHz）。
 - [ ] **[待实测] 轮径**：卡尺量轮胎外径，或推车让轮转 10 圈量直线距离 /10/π。
 - [ ] **[待实测] 轮距**：两轮接地中心距（不是车宽）。
 - [ ] **[待实测] 里程标定**：手推 1.000 m 读编码器总计数，`mm_per_count = 1000 / counts`，与 `1320 counts/rev × π × 轮径` 对比，**偏差 > 3% 说明轮径或 PPR 有误**。
 - [ ] **[待实测] 左右编码器前向符号**：手推车前进，看两个 CNT 是增是减，确认 `BOARD_ENC_L/R_FORWARD_SIGN`。映射反了的表现是**原地打转**。
 - [ ] **[待实测] 电机正反向与 PB6/PB7 的对应**：确认 `BOARD_MOTOR_L_FORWARD_CH/REVERSE_CH` 与实际 H 桥输入一致，以及 `BOARD_MOTOR_RIGHT_INVERT` 是否真的需要取反。
 - [ ] **[待实测] TIM6 实际节拍周期**：看启动横幅 `fast tick:` 行的 标称/实测/修正后；若 `update ... -> …Hz` 不在 100 Hz 附近，说明校准失败，先查 TIM6 是否已启动。
+- [ ] **[待实测] IMU 采样率**：1 Hz 行 `IMU: <n>/s` 必须 ≈ 100。若明显偏低，看 `CNT: imu<n>`（信号量满 = IMU 任务跟不上）和 `imu2<n>`（等不到节拍 = TIM6 停了）。
+- [ ] **[待实测] 蓝牙命令链路**：串口助手（COM10，**115200**）发 `G 700 -700\n`。期望串口出现 `[nav] G 700 -700 accepted, 10 waypoints`；发 `S\n` 出现 `[nav] STOP`；`CNT: qc<n>` 在快速连发时会涨（Q_Cmd 覆盖最旧）。
+- [ ] **[待实测] `?` / `P` 的回复**：目前解析器接受，但**下行回复还没接线**，所以蓝牙那头不会有回话，只有 USART2 调试口有日志。
+- [ ] **[待实测] 8 个任务的栈剩余**：`[1s] STK:` 8 个数字（顺序见 §十一.5），每个都必须 > 30%。IMU 任务只有 512 B，最可能先不够。
+- [ ] **[待实测] 真机 10 分钟跑机**：不能复位、不能 HardFault、堆 `H:` 不下降。
 - [ ] **[待实测] 第二路电机到底接在哪四根线**：PB6/PB7 只能驱动一个电机，右轮当前按 **TIM2_CH1/CH2 = PA0/PA1** 假设实现（见 `board_pins.h` §3，标了 ASSUMPTION）。
 
 ### 7.2 必须问队友 / 课程
@@ -283,3 +290,137 @@ py -3 tools\md2docx.py <in.md> <out.docx> --lang cn|en   :: 文档转换
 | `q1` / `q2` | 队列峰值占用 |
 | `lat` | 中断 → 任务唤醒延迟（实测 12–15 µs） |
 | `cmd` / `lost` | 已发 SCAN 命令数 / 流看门狗判定丢流次数 |
+
+---
+
+## 十一、Part 2 Phase B/C 实现记录（2026-11-17）
+
+> 这一节是"代码里到底是什么"，与 §七（"还要在板上确认什么"）分开写。
+> 除标注"主机侧已验证"的纯逻辑外，**本节所有数字都还没有在板子上量过**。
+
+### 11.1 文件清单
+
+**新增**
+
+| 文件 | 作用 |
+|---|---|
+| `Core/Inc/i2c_bus.h` + `Src/i2c_bus.c` | I2C1 唯一所有者：`osMutexPrioInherit` 互斥量、有界事务、重试、时钟脉冲恢复、DWT 实测持锁时间 |
+| `Core/Inc/oled.h` + `Src/oled.c` | SSD1306 128x64：显存/绘图、按页刷新、传输缝 `oled_bus_write()` |
+| `Core/Inc/oled_font.h` + `Src/oled_font.c` | 6x8 ASCII 字库（0x20..0x7E 共 95 个，已离线渲染逐个核对） |
+| `Core/Inc/bt_rx.h` + `Src/bt_rx.c` | UART5 RX：DMA1_Stream0 + IDLE 行检测 + 环形缓冲，ISR 只拷贝 |
+| `Core/Src/bt_protocol.c` | `bt_parse_line()` / `bt_error_text()`（纯函数，无 HAL 无 RTOS） |
+| `Core/Inc/pose.h` + `Src/pose.c` | 里程计 + 陀螺航向 → 位姿 |
+| `Core/Inc/path.h` + `Src/path.c` | `Q_Path` 消息、直线路点生成、航向控制律 |
+| `Core/Inc/log.h` + `Src/log.c` | USART2 TX 环形缓冲 + DMA（非阻塞日志，规范 §5.4） |
+
+**修改**
+
+| 文件 | 改了什么 |
+|---|---|
+| `Core/Src/app_rtos.c` / `Inc/app_rtos.h` | 2 个任务 → **8 个任务**、3 个队列、信号量、事件标志、1 Hz 状态行、任务计时 |
+| `Core/Src/app.c` / `Inc/app.h` | 初始化顺序（RTOS → i2c → log → telemetry → imu → oled → pose → bt_rx → NVIC → 校准）、NVIC 表、新增回调（UART5 RX / TX / 错误）、非阻塞 `dbg_printf`、`dbg_task_started()` |
+| `Core/Src/imu.c` / `Inc/imu.h` | 采样从 TIM6 中断搬到 IMU 任务；I2C 改走 `i2c_bus_*`；新增 `imu_sample_once()` |
+| `Core/Src/stm32f4xx_it.c` | 新增 `DMA1_Stream0_IRQHandler`（蓝牙收）、`DMA1_Stream6_IRQHandler`（日志发） |
+| `Core/Src/telemetry.c` / `Inc/telemetry.h` | `HAL_UART_TxCpltCallback` 移到 `app.c` 统一分发（否则与日志 DMA 抢同一个弱符号）；新增 `telemetry_on_tx_complete()` |
+| `Core/Inc/i2c_bus.h` / `Inc/bt_rx.h` | **纯增量**：`I2C_BUS_*` 返回码、`stats.boot_locks`、`bt_rx_on_error()`、`bt_rx_dma_irq_handler()`、`stats.uart_errors`。既有函数签名与语义**未改** |
+
+### 11.2 8 个任务的实际创建参数
+
+| # | 线程 | 名字 | 优先级 | 栈(B) | 周期/触发 | 调度方式 |
+|---|---|---|---|---|---|---|
+| 1 | PID + Motor | `pidMotor` | 40 | 1024 | 10 ms | `osDelayUntil` |
+| 2 | IMU | `imuAcq` | 37 | 512 | 10 ms | 计数信号量（TIM6） |
+| 3 | Pose | `pose` | 36 | 768 | 10 ms | `osDelayUntil` |
+| 4 | LiDAR | `lidarProc` | 34 | 1536 | ~22 ms/块 | `Q_Lidar`（100 ms 守卫超时） |
+| 5 | PathGen | `pathGen` | 30 | 1024 | 命令到达 | `Q_Cmd`（`osWaitForever`） |
+| 6 | BT RX | `btRx` | 28 | 768 | 字节到达 | 计数信号量（100 ms 守卫） |
+| 7 | BT TX | `btTx` | 22 | 1024 | 50 ms | `osDelayUntil` |
+| 8 | OLED | `oled` | 20 | 1024 | 50 ms | `osDelayUntil` |
+
+- 优先级数字就是规范 §1.2 表里的数字（注意 CMSIS 枚举里 `osPriorityAboveNormal` 其实是 32，不是 37；**代码里用表里的数字并用 7 条 `_Static_assert` 锁死相对顺序**）。
+- 每个任务启动时打印一行 `[task] <名字> per=<周期或 event> prio=<n> stk=<B>`，用来确认调度器真的启动了。这一行**不走 `vsnprintf`**，所以 512 B 栈的 IMU 任务也安全。
+- 10 ms 任务的 WCET 之和预算 1.4 ms（§1.3 上限 2 ms），**实测值待上板**，见 1 Hz 行 `T10:` 字段。
+
+### 11.3 三个队列
+
+| 队列 | 容量 | 消息大小 | 生产者 → 消费者 | 溢出策略**落在哪一行代码** |
+|---|---|---|---|---|
+| `Q_Lidar` | 8 | 12 B `lidar_block_desc_t` | DMA ISR → LiDAR 任务 | 满则丢弃：`app_rtos_post_block()` 里 `blocks_dropped++` |
+| `Q_Cmd` | 4 | 8 B `cmd_msg_t` | BT RX 任务 → PathGen | 满则覆盖最旧：`cmd_sink()` 里先 `osMessageQueueGet` 再 `Put`，`q_cmd_overwrite++` |
+| `Q_Path` | 16 | 8 B `path_point_t` | PathGen → PID+Motor | 生产方阻塞 50 ms：`path_task()` 里 `osMessageQueuePut(..., APP_Q_PATH_PUT_TMO_MS)`，超时则 `q_path_timeout++` + 整条路径作废并回 `STOP` |
+
+- **没有 `Q_Enc`**（编码器是 TIM1/TIM8 硬件计数器，Pose 任务直接读），**没有 `Q_Set`**（PID 与电机合并成一个任务，setpoint 是局部变量）。
+- 停机通知用的是**事件标志** `evt_nav`（`STOP` / `NEW_PATH`），不是第四个队列：它没有载荷，而且 `Q_Path` 需要被整条清空。
+- `Q_Path` 的消费端逻辑：追上当前路点后**在同一周期内继续取下一点**，避免每 100 mm 停一下。
+
+### 11.4 中断优先级（`app_init()` 最后一次统一断言）
+
+| IRQ | 优先级 | 调用 RTOS API | 理由 |
+|---|---|---|---|
+| TIM7（HAL tick） | **0（不许动）** | 否 | 交接文档坑 1 |
+| USART3 / DMA1_Stream1（雷达） | 5 | 是（`Q_Lidar`） | 必须 ≥ `MAX_SYSCALL`(5) |
+| **TIM6**（10 ms 节拍） | **5**（原 7） | 是（`osSemaphoreRelease`） | 同上，Part 2 要求 |
+| **UART5**（蓝牙） | **5**（原 6） | 是（唤醒 BT RX） | 同上 |
+| **DMA1_Stream0**（蓝牙收） | 5 | 是 | 新增 |
+| I2C1 EV/ER | 6 | 否（事务已改为同步） | 不能抢占内核临界区 |
+| DMA1_Stream6（日志发） / Stream7（遥测发） | 6 | 否 | 同上 |
+| USART2 | 7 | 否（轮询） | — |
+
+### 11.5 1 Hz 状态行（7 行，每行 ≤ 80 字符，都以 `[1s]` 开头便于 grep）
+
+```
+[1s] L: blk25 q0/8 p800 | M: per9.98 jit120 wc180 | C: q2/4
+[1s] P: eh12.3 ex-4 ey0 | QP: 7 | PATH: g10 r3
+[1s] I2C: ok950 err2 hold1.8ms | H: 24680/32768 | WD: 0 | IMU: 99/s
+[1s] STK: 1040 520 498 512 380 690 900 1010
+[1s] T10: m9.98/120/180 p10.02/90/120 | ov m0 p0
+[1s] T50: b50.03/210/900 o50.01/140/1200 | ov b0 o0
+[1s] CNT: ql0 qc0 qpt0 imu0 bt(s0 r0 o0 u0) log0 imu2 0
+```
+
+- **STK 顺序固定**：PID+Motor / IMU / Pose / LiDAR / PathGen / BT RX / BT TX / OLED（单位 B，剩余量）。
+- `T10` / `T50` 每项是 `周期ms/抖动µs/WCETµs`，`ov` 是超时次数；`m`=电机、`p`=Pose、`b`=BT TX、`o`=OLED。
+- `CNT`：`ql`=Q_Lidar 丢块、`qc`=Q_Cmd 覆盖、`qpt`=Q_Path 超时、`imu`=信号量满（IMU 落后）、`bt(s r o u)`=语法错/越界/超长/串口错、`log`=日志丢字节、`imu2`=等不到 TIM6 节拍次数。
+- **`WD: 0` 是刻意的**：IWDG 还没启用，不许把 0 写成别的数字假装看门狗在跑。
+- 与规范 §7 的差异（见 11.6）：为了每行 ≤ 80 字符且覆盖"每个周期任务"，拆成 7 行而不是 3 行，字段集合是 §7 的超集。
+
+### 11.6 与现有文档的三处偏差（必须知道，别当 bug 又"修"回去）
+
+1. **`oled.h` / 规范 §3.4 的"一页 ≈1.5 ms"算错了。** 100 kHz 下 128 B 数据 + 1 控制字节 = 129 B = 1032 bit ≈ **11.6 ms**，不是 1.5 ms（1.5 ms 对不上 100 kHz 也对不上 400 kHz）。代码因此把一页拆成 **32 字节/事务**（33 B ≈ 2.97 ms），这样单次持锁仍在 §2.4 的 3 ms 目标内；代价是一页要 5 次事务。**真实持锁时间以 `I2C: hold` 的实测值为准。**
+   → 直接后果：OLED 任务单次执行时间约 11–12 ms，**超过 §1.2 给的 3 ms WCET 预算**。因为它是优先级最低的任务，不影响控制环；但报告里要么写实测值并说明，要么把 I2C 提到 400 kHz（约 3 ms/页）。
+2. **`oled.h` 的 `OLED_ERR_ABSENT` 与 `OLED_ERR_BUS` 的区分**靠 `i2c_bus` 新增的 `I2C_BUS_NACK`/`I2C_BUS_ERR`：地址 NACK = 面板不在；其它错误 = 总线坏。既有返回码语义没变。
+3. **状态行 7 行**（见 11.5）替代 §7 的 3 行示例；另外 §5.4 的"单行 ≤ 80 字符 / 每秒 1 行"改成了"DMA 环形缓冲 + 每行 ≤ 80 字符"—因为 `dbg_printf` 已改成非阻塞（`log.c`），不再占着 UART 阻塞任务。
+
+### 11.7 编译结果
+
+```
+make -C Debug -j8 all
+text 86468  data 96  bss 47712   0 warning / 0 error
+```
+
+（基线是 text 59048 / 0 warning；RAM 用量 data+bss = 47.8 KB / 128 KB。）
+`Debug/Core/Src/subdir.mk` 与 `Debug/objects.list` 是 CubeIDE 生成的产物（`Debug/` 已被 git 忽略），
+新增源文件后需要它们同步更新，否则**编译得出 .o 但链接时根本没带上**（`objects.list` 才是链接清单）。
+在 IDE 里按 F5 刷新或在 IDE 里编一次即可自动重生成。
+
+### 11.8 哪些逻辑真的验证过（只有这些，别扩大）
+
+| 模块 | 验证方式 | 结果 |
+|---|---|---|
+| `bt_parse_line` / `bt_error_text` | 主机 gcc 单元测试 `tools/host_tests/test_bt_protocol.c` | 46 条全通过：大小写、重复空格、CRLF、缺参、粘连 token、尾随垃圾、`\n` 之后还有垃圾、±5000 边界、21 位数字不溢出、NULL 参数、失败时 `*out` 不被改写 |
+| `path_generate_line` / `path_track_step` / `path_arrived` | 主机 gcc 单元测试 `tools/host_tests/test_path.c` | 61 条全通过：路点数量/末点精确/FINAL 标志/单调性/步长/容量边界、到达半径边界、直行左右等速、原地转向左右轮反向且对称、偏航限幅、零距离不产生 NaN |
+| `pose_update` 符号约定 | 主机 gcc 单元测试 `tools/host_tests/test_pose.c` | 18 条全通过：前进 +y、倒车 −y、陀螺 +90° 偏移、轮差航向符号、原地转不位移、航向回绕、零周期不产生 inf |
+| 字库 6x8 | 离线渲染成 PNG 逐个看 | 95 个字符全部可读、位置正确 |
+| 其余（HAL 时序、DMA、RTOS 调度、OLED/IMU 真机行为） | **没有验证过** | 见 §七.1 |
+
+跑法（任意主机 C 编译器，不需要板子）：
+
+```cmd
+tools\host_tests\run_tests.cmd
+:: 期望最后一行 ALL HOST TESTS PASSED
+```
+
+> **注意分寸**：主机测试全绿只证明"逻辑自洽"，**不证明车能跑**。
+> 凡是依赖 HAL / DMA / RTOS / 真面板的，一律算 §七.1 的待上板项。
+
+

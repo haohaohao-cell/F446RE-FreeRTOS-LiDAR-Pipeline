@@ -272,15 +272,17 @@ void telemetry_on_error(void)
   stats.errors++;
 }
 
+void telemetry_on_tx_complete(void)
+{
+  tx_busy = 0U;
+}
+
 void telemetry_get_stats(telemetry_stats_t *out)
 {
   memcpy(out, &stats, sizeof(stats));
 }
 
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == UART5)
-  {
-    tx_busy = 0U;
-  }
-}
+/* HAL_UART_TxCpltCallback used to live here (UART5 only).  It moved to app.c in
+ * Phase C: that callback is now shared with the USART2 log DMA, and two
+ * definitions of one weak symbol would either fail to link or silently hide one
+ * of the two paths. */

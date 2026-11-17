@@ -62,6 +62,16 @@ int bt_rx_init(void);
  * reception and returns.  No malloc, no parsing, no queueing. */
 void bt_rx_isr_event(uint16_t size);
 
+/* Interrupt-context error notification (added in Phase C).  Called from the
+ * UART5 error callback; it only raises a flag, so reception is repaired in task
+ * context by bt_rx_process() rather than inside an ISR
+ * (CODING_STANDARDS 5.2: "error callback -> flag/event only"). */
+void bt_rx_on_error(void);
+
+/* Interrupt-context DMA completion entry point, called from
+ * DMA1_Stream0_IRQHandler.  Kept here because the DMA handle is private. */
+void bt_rx_dma_irq_handler(void);
+
 /* Task-context worker: drain whole lines out of the ring, parse them with
  * bt_parse_line() and hand the accepted ones to the sink.  Safe to call even
  * when no complete line has arrived yet (returns quickly).
@@ -80,6 +90,9 @@ typedef struct
   uint32_t range_err;  /* BT_ERR_RANGE from the parser                    */
   uint32_t queued;     /* commands accepted by the sink                    */
   uint32_t busy;       /* sink returned BT_ERR_BUSY                        */
+  /* UART/DMA errors seen, including re-arms that failed (added in Phase C).
+   * Counted so that "the link recovered" is visible rather than assumed. */
+  uint32_t uart_errors;
 } bt_rx_stats_t;
 
 void bt_rx_get_stats(bt_rx_stats_t *out);

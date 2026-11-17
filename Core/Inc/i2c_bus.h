@@ -46,6 +46,14 @@ int i2c_bus_init(void);
  * releases the bus, including when the transfer fails.  All return 0 on success
  * and a negative value on failure; none of them block indefinitely. */
 
+/* Failure codes.  They are all negative, so `if (ret < 0)` remains sufficient;
+ * callers that want to tell "no such device" from "broken bus" can compare.
+ * (Added in Phase C; the success path and the sign convention are unchanged.) */
+#define I2C_BUS_OK       0
+#define I2C_BUS_ERR     (-1)   /* transfer failed (not a simple NACK)      */
+#define I2C_BUS_NACK    (-2)   /* address NACKed: nothing at that address  */
+#define I2C_BUS_TIMEOUT (-3)   /* mutex not obtained, transfer not run     */
+
 /* Raw write (used by the SSD1306: control byte + payload in one transaction). */
 int i2c_bus_write(uint8_t addr7, const uint8_t *buf, uint16_t len, uint32_t tmo_ms);
 
@@ -75,6 +83,11 @@ typedef struct
   uint32_t lock_timeouts; /* never got the mutex within the timeout      */
   uint32_t recoveries;    /* i2c_bus_recover() calls that succeeded      */
   uint32_t hold_us_max;   /* longest mutex hold observed, microseconds   */
+  /* Transfers performed before osKernelStart(), i.e. during single-threaded
+   * init, where the mutex is pointless.  Counted rather than compiled out so
+   * that "the mutex was skipped" is visible in the boot log instead of being
+   * an assumption.  (Field added in Phase C.) */
+  uint32_t boot_locks;
 } i2c_bus_stats_t;
 
 void i2c_bus_get_stats(i2c_bus_stats_t *out);

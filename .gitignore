@@ -22,6 +22,9 @@ venv/
 # ---- runtime logs produced by tools/*.cmd -------------------------------
 tools/logs/
 
+# ---- host unit-test binaries (tools/host_tests, see its README) ---------
+tools/host_tests/*.exe
+
 # ---- OS / editor noise --------------------------------------------------
 Thumbs.db
 desktop.ini
