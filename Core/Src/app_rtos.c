@@ -915,7 +915,9 @@ static void status_line_1hz(void)
   }
 
   /* ---- line 7: the failure counters CODING_STANDARDS 5.5 requires ------ */
-  dbg_printf("[1s] CNT: ql%lu qc%lu qpt%lu imu%lu bt(s%lu r%lu o%lu u%lu) log%lu imu2%lu\r\n",
+  /* Label note: the old label "imu2" printed as "imu20" when the value was 0,
+   * which reads like the number 20.  Renamed to iw (IMU wait timeouts). */
+  dbg_printf("[1s] CNT: ql%lu qc%lu qpt%lu imu%lu bt(s%lu r%lu o%lu u%lu) log%lu iw%lu\r\n",
              (unsigned long)rs.blocks_dropped,
              (unsigned long)rs.q_cmd_overwrite,
              (unsigned long)rs.q_path_timeout,

@@ -6,13 +6,13 @@
  *
  *   #  thread          schedule            period/trigger   prio  stack  WCET
  *   1  PID + Motor     osDelayUntil         10 ms            40   1024   <700us
- *   2  IMU             semaphore (TIM6)     10 ms            37    512   <300us
+ *   2  IMU             semaphore (TIM6)     10 ms            37   1024   <300us
  *   3  Pose            osDelayUntil         10 ms            36    768   <400us
  *   4  LiDAR           Q_Lidar (100ms guard) ~22 ms           34   1536   <900us
  *   5  PathGen         Q_Cmd                on command       30   1024   <500us
  *   6  BT RX           UART5 semaphore      on bytes         28    768   <200us
  *   7  BT TX           osDelayUntil         50 ms            22   1024   <2 ms
- *   8  OLED            osDelayUntil         50 ms            20   1024   <3 ms
+ *   8  OLED            osDelayUntil         50 ms            20   2048   <3 ms
  *
  * Queues, exactly three (CODING_STANDARDS 2.2 sets the overflow policy):
  *   Q_Lidar  8 x 12 B  ISR -> LiDAR task         full: drop,      q_lidar_drop
@@ -80,13 +80,28 @@ _Static_assert(APP_PRIO_OLED      > 0U,             "must be above idle");
 
 /* ---- stack sizes, bytes (CMSIS-RTOS2 osThreadAttr_t semantics) ----------- */
 #define APP_STK_PID_MOTOR     1024U
-#define APP_STK_IMU            512U
+/* MEASURED ON HARDWARE 2026-11-17: 512 was not enough.  With the task's stack
+ * base at 0x20003AC0, the saved stack pointer was 0x20003A9C - 36 bytes BELOW
+ * the base - and FreeRTOS' overflow hook (configCHECK_FOR_STACK_OVERFLOW=2)
+ * fired on the first context switch after the first I2C sample.  Cause: an -O0
+ * build with the whole HAL_I2C_Mem_Read -> I2C_WaitOnFlagUntilTimeout chain on
+ * the stack.  1024 leaves ~2x margin over the ~550 bytes actually needed; the
+ * high-water mark is printed in the 1 Hz STK line, so raise it further if that
+ * number drops below 30 % of 1024.  (CODING_STANDARDS 1.4: grow, never shave.) */
+#define APP_STK_IMU           1024U
 #define APP_STK_POSE           768U
 #define APP_STK_LIDAR         1536U
 #define APP_STK_PATH          1024U
 #define APP_STK_BT_RX          768U
 #define APP_STK_BT_TX         1024U
-#define APP_STK_OLED          1024U
+/* MEASURED ON HARDWARE 2026-11-17: with 1024 the OLED task had only 40 bytes of
+ * headroom left (STK line: "... 636 40"), i.e. it was one function frame away
+ * from the same overflow-hook freeze that the IMU task hit.  Blame the 1 Hz
+ * status block: eight fixed-point dbg_printf() calls each carry a 128-byte
+ * format buffer plus the vsnprintf frame, on top of eight oled_row() calls.
+ * 2048 leaves ~50 % free.  This task is the last one in the priority order, so
+ * spending another 1 KiB of heap here costs nothing else. */
+#define APP_STK_OLED          2048U
 
 /* ---- task identifiers, used for the STK line (order is fixed & documented) */
 #define APP_TASK_COUNT        8U

@@ -95,7 +95,21 @@ static uint16_t log_kick(int from_isr)
 
   if (busy != 0U)
   {
-    return 0U;
+    /* DEFENSIVE SELF-HEAL (added after a hardware session where a lost
+     * completion interrupt latched busy=1 and silently killed all further
+     * console output): if the UART says it is idle, no transfer can be in
+     * flight, so the flag is stale.  Clearing it here costs nothing on the
+     * normal path and turns a permanently silent console into a one-chunk
+     * hiccup.  The real completion path below stays the primary one. */
+    if ((huart2.hdmatx != NULL) && (huart2.gState == HAL_UART_STATE_READY))
+    {
+      busy = 0U;
+      stats.dma_errors++;
+    }
+    else
+    {
+      return 0U;
+    }
   }
 
   /* Two preconditions, both learned from the F4 HAL's own behaviour:
