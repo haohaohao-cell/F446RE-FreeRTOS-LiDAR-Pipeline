@@ -39,6 +39,7 @@
 #define BT_PROTOCOL_H
 
 #include <stdint.h>
+#include <stddef.h>   /* offsetof, used by the layout asserts below */
 
 /* ------------------------------------------------------------------------- */
 /* Q_Cmd message                                                             */
@@ -60,6 +61,14 @@ typedef struct
   int16_t  y_mm;       /* + forward, valid for CMD_TYPE_GO only       */
   uint16_t reserved2;  /* 0; pads the message to 8 bytes              */
 } cmd_msg_t;
+
+/* The 8-byte size is an interface contract, not an accident: one Q_Cmd message
+ * is a pair of 32-bit words, cheap to copy in and out of the queue, and the
+ * reserved fields exist only to keep it there.  Adding a field without
+ * thinking will silently change what a queue copy costs and which bytes the
+ * producer and consumer agree on, so make it a build error instead. */
+_Static_assert(sizeof(cmd_msg_t) == 8, "Q_Cmd message must stay 8 bytes");
+_Static_assert(offsetof(cmd_msg_t, x_mm) == 2, "x_mm must be 2-byte aligned");
 
 /* Queue depth for Q_Cmd (see CODING_STANDARDS 2.2). */
 #define Q_CMD_CAPACITY        4U
