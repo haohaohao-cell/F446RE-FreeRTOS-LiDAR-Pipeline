@@ -76,9 +76,8 @@
 #define BOARD_TIM6_PERIOD      ((uint16_t)99U)
 
 /* ========================================================================== */
-/* 3. Motor PWM: TIM4_CH1/CH2 -> PB6/PB7 (AT8236 AIN1/AIN2)                  */
+/* 3. Motor PWM: two H-bridge channels                                        */
 /* ========================================================================== */
-
 /* lessonProgram/Board.c wrote PSC=0, ARR=799 with the comment
  * "16 MHz / 800 = 20 kHz" - that arithmetic assumes a 16 MHz timer clock and
  * is wrong for this board.  At 168 MHz it yields 210 kHz.
@@ -93,42 +92,56 @@ _Static_assert((BOARD_TIM_CLK_HZ / ((uint32_t)BOARD_MOTOR_PWM_PSC + 1UL) /
                "TIM4 prescaler/period do not produce the requested PWM frequency");
 _Static_assert(BOARD_MOTOR_PWM_PERIOD <= 65535U, "TIM4 ARR does not fit");
 
-#define BOARD_MOTOR_TIMER          TIM4
-#define BOARD_MOTOR_TIMER_IRQn     TIM4_IRQn
-#define BOARD_MOTOR_L_FORWARD_CH   1U   /* TIM4_CH1 -> PB6 */
-#define BOARD_MOTOR_L_REVERSE_CH   2U   /* TIM4_CH2 -> PB7 */
-#define BOARD_MOTOR_L_PORT         GPIOB
-#define BOARD_MOTOR_L_PIN          GPIO_PIN_6
-#define BOARD_MOTOR_R_PORT         GPIOB
-#define BOARD_MOTOR_R_PIN          GPIO_PIN_7
-
-/* ---- second wheel: which pins?  ASSUMPTION, NOT verified -----------------
- * PB6/PB7 are two H-bridge inputs: that is ONE motor (lessonProgram drove a
- * single motor this way - PWM on AIN1, AIN2 held low).  A two-wheel car needs
- * four such inputs, so the right wheel must be on another pair.  TIM4_CH3/CH4
- * are PB8/PB9, which this project uses for I2C1, so TIM4 cannot supply them.
+/* ---------------------------------------------------------------------------
+ * WHEEL-TO-CHANNEL MAPPING WAS MEASURED ON HARDWARE 2026-11-17, and it is the
+ * opposite of what this file used to assume.
  *
- * Provisional mapping (confirm against the real wiring before the car drives):
- *     right wheel -> TIM2_CH1 (PA0), TIM2_CH2 (PA1)
- * Both pins are unused in this project.  They are NOT unused in lessonProgram
- * (PA0 was an ADC input there), which is exactly why this is flagged.
+ * Method: single-channel open-loop jogs (`l` / `r` on the console) while reading
+ * the two hardware encoder totals over SWD:
+ *      left channel  (TIM4/PB6/PB7) +20 %  ->  right encoder moved -4778 counts
+ *      right channel (TIM2/PA0/PA1) +20 %  ->  nothing moved
+ * Conclusion:
+ *   1. the one motor that is fitted is on PB6/PB7 (TIM4), and it is the RIGHT
+ *      wheel of the car, not the left one;
+ *   2. nothing is connected to PA0/PA1 (TIM2) yet;
+ *   3. that motor's polarity is reversed - a positive applied duty turned it
+ *      backwards - which is exactly what BOARD_MOTOR_RIGHT_INVERT compensates.
  *
- * Retargeting to another wiring means editing the six constants below, nothing
- * else in the motor layer refers to a pin. */
-#define BOARD_MOTOR2_TIMER         TIM2
-#define BOARD_MOTOR2_TIMER_IRQn    TIM2_IRQn
-#define BOARD_MOTOR2_FORWARD_CH    1U   /* TIM2_CH1 -> PA0 */
-#define BOARD_MOTOR2_REVERSE_CH    2U   /* TIM2_CH2 -> PA1 */
-#define BOARD_MOTOR2_FWD_PORT      GPIOA
-#define BOARD_MOTOR2_FWD_PIN       GPIO_PIN_0
-#define BOARD_MOTOR2_REV_PORT      GPIOA
-#define BOARD_MOTOR2_REV_PIN       GPIO_PIN_1
-#define BOARD_MOTOR2_AF            GPIO_AF1_TIM2
+ * So the two groups are swapped below relative to the old assumption: the
+ * logical LEFT wheel now owns TIM2/PA0/PA1 and the logical RIGHT wheel owns
+ * TIM4/PB6/PB7.  Do NOT also swap the motor's two leads: the inversion is
+ * handled here, and doing both would invert twice and make the car spin.
+ *
+ * The left wheel's pins remain an ASSUMPTION (nothing is wired there yet):
+ * TIM2_CH1 = PA0, TIM2_CH2 = PA1.  PA0 was an ADC input in lessonProgram, so
+ * confirm before connecting anything to it.
+ * ------------------------------------------------------------------------- */
 
-/* Right-wheel electrical polarity.  lessonProgram inverted the right channel
- * ("AIN is wired to the physical right wheel with reversed polarity"), so the
- * same inversion is assumed here and must be re-checked the first time the car
- * drives. */
+/* ---- LEFT wheel: TIM2_CH1/CH2 -> PA0/PA1   (ASSUMPTION, not yet wired) ---- */
+#define BOARD_MOTOR_TIMER          TIM2
+#define BOARD_MOTOR_TIMER_IRQn     TIM2_IRQn
+#define BOARD_MOTOR_AF             GPIO_AF1_TIM2
+#define BOARD_MOTOR_L_FORWARD_CH   1U   /* TIM2_CH1 -> PA0 */
+#define BOARD_MOTOR_L_REVERSE_CH   2U   /* TIM2_CH2 -> PA1 */
+#define BOARD_MOTOR_L_PORT         GPIOA
+#define BOARD_MOTOR_L_PIN          GPIO_PIN_0
+#define BOARD_MOTOR_R_PORT         GPIOA
+#define BOARD_MOTOR_R_PIN          GPIO_PIN_1
+
+/* ---- RIGHT wheel: TIM4_CH1/CH2 -> PB6/PB7  (MEASURED: motor is here) ------ */
+#define BOARD_MOTOR2_TIMER         TIM4
+#define BOARD_MOTOR2_TIMER_IRQn    TIM4_IRQn
+#define BOARD_MOTOR2_FORWARD_CH    1U   /* TIM4_CH1 -> PB6 */
+#define BOARD_MOTOR2_REVERSE_CH    2U   /* TIM4_CH2 -> PB7 */
+#define BOARD_MOTOR2_FWD_PORT      GPIOB
+#define BOARD_MOTOR2_FWD_PIN       GPIO_PIN_6
+#define BOARD_MOTOR2_REV_PORT      GPIOB
+#define BOARD_MOTOR2_REV_PIN       GPIO_PIN_7
+#define BOARD_MOTOR2_AF            GPIO_AF2_TIM4
+
+/* Right-wheel electrical polarity: MEASURED, not assumed any more.  A positive
+ * duty on TIM4/PB6/PB7 turned the physical right wheel backwards, so the sign is
+ * flipped here.  Keep it at 1 unless the motor wiring itself changes. */
 #define BOARD_MOTOR_RIGHT_INVERT   1
 
 /* lessonProgram MOTOR_DEFAULT_* values are kept (tuned on the same chassis);
@@ -180,8 +193,8 @@ _Static_assert(BOARD_MOTOR_PWM_PERIOD <= 65535U, "TIM4 ARR does not fit");
 
 #define BOARD_TIM_HAL_TICK         TIM7   /* HAL 1 ms tick, DO NOT TOUCH (HANDOVER 5.1) */
 #define BOARD_TIM_FAST_TICK        TIM6   /* 10 ms cadence -> IMU semaphore              */
-#define BOARD_TIM_MOTOR_L          TIM4   /* left  wheel PWM, 20 kHz                     */
-#define BOARD_TIM_MOTOR_R          TIM2   /* right wheel PWM, 20 kHz (see section 3)     */
+#define BOARD_TIM_MOTOR_L          TIM2   /* left  wheel PWM, 20 kHz (see section 3)     */
+#define BOARD_TIM_MOTOR_R          TIM4   /* right wheel PWM, 20 kHz - motor fitted here */
 #define BOARD_TIM_MICROS           TIM5   /* free-running 1 MHz timestamp (32-bit)       */
 #define BOARD_TIM_MICROS_PSC       ((uint16_t)((BOARD_TIM_CLK_HZ / 1000000UL) - 1U))
 

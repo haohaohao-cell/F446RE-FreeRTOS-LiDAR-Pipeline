@@ -290,9 +290,15 @@ void app_rtos_bt_rx_event(void)
 #define BENCH_DUTY_PCT     20      /* open-loop duty, percent              */
 #define BENCH_HOLD_MS    1500U     /* burst length, milliseconds           */
 
-static volatile int8_t   bench_duty;        /* 0 = off, else -100..+100     */
+static volatile int8_t   bench_duty_l;      /* 0 = off, else -100..+100     */
+static volatile int8_t   bench_duty_r;      /* per wheel, so a single channel
+                                             * can be exercised on its own   */
 static volatile uint32_t bench_deadline_ms; /* HAL tick when the burst ends */
 static uint8_t           bench_latched;     /* duty is currently applied    */
+
+/* Set by the 'c' console key, consumed by the Pose task - the only owner of the
+ * encoder counters (see the single-owner comment at the 'c' handler). */
+static volatile uint8_t  g_pose_reset_req;
 
 /* ========================================================================== */
 /* Task 1: PID + Motor (10 ms)                                                */
@@ -340,18 +346,20 @@ static void pid_motor_task(void *argument)
     }
 
     /* ---- bench burst: open-loop drive, wheels off the ground -------------- */
-    if ((bench_duty != 0) && ((int32_t)(bench_deadline_ms - HAL_GetTick()) > 0))
+    if (((bench_duty_l != 0) || (bench_duty_r != 0)) &&
+        ((int32_t)(bench_deadline_ms - HAL_GetTick()) > 0))
     {
       have_wp = 0U;   /* cancel tracking; the queue keeps its waypoints */
       stopped = 1U;
-      motor_set_duty_percent(bench_duty, bench_duty);
+      motor_set_duty_percent(bench_duty_l, bench_duty_r);
       bench_latched = 1U;
     }
     else if (bench_latched != 0U)
     {
       /* Burst finished (timeout or 'x').  Stop here, once, so the PWM really goes
        * to zero instead of holding the last CCR value. */
-      bench_duty = 0;
+      bench_duty_l = 0;
+      bench_duty_r = 0;
       bench_latched = 0U;
       have_wp = 0U;
       stopped = 1U;
@@ -481,6 +489,16 @@ static void pose_task(void *argument)
   {
     tick += APP_PERIOD_FAST_MS;
     timing_begin(APP_TIMING_POSE, APP_PERIOD_FAST_MS * 1000U);
+
+    /* Console 'c' asked for a zero.  Done HERE, not in the console handler,
+     * because this task is the only owner of the encoder counters: zeroing them
+     * from another task could tear a 32-bit total that is being accumulated. */
+    if (g_pose_reset_req != 0U)
+    {
+      g_pose_reset_req = 0U;
+      pose_reset();
+      dbg_printf("[enc] zeroed at this pose\r\n");
+    }
 
     pose_update(APP_PERIOD_FAST_MS);
 
@@ -679,29 +697,77 @@ static void console_poll(void)
   }
   else if ((ch == (uint8_t)'f') || (ch == (uint8_t)'F'))
   {
-    bench_duty = (int8_t)BENCH_DUTY_PCT;
+    bench_duty_l = (int8_t)BENCH_DUTY_PCT;
+    bench_duty_r = (int8_t)BENCH_DUTY_PCT;
     bench_deadline_ms = HAL_GetTick() + BENCH_HOLD_MS;
-    dbg_printf("[bench] forward %d%% for %lu ms - wheels OFF the ground\r\n",
+    dbg_printf("[bench] both forward %d%% for %lu ms\r\n",
                (int)BENCH_DUTY_PCT, (unsigned long)BENCH_HOLD_MS);
   }
   else if ((ch == (uint8_t)'b') || (ch == (uint8_t)'B'))
   {
-    bench_duty = (int8_t)(-BENCH_DUTY_PCT);
+    bench_duty_l = (int8_t)(-BENCH_DUTY_PCT);
+    bench_duty_r = (int8_t)(-BENCH_DUTY_PCT);
     bench_deadline_ms = HAL_GetTick() + BENCH_HOLD_MS;
-    dbg_printf("[bench] reverse %d%% for %lu ms - wheels OFF the ground\r\n",
+    dbg_printf("[bench] both reverse %d%% for %lu ms\r\n",
+               (int)BENCH_DUTY_PCT, (unsigned long)BENCH_HOLD_MS);
+  }
+  else if ((ch == (uint8_t)'l') || (ch == (uint8_t)'L'))
+  {
+    /* Left channel ONLY.  Which physical wheel moves tells us which timer
+     * channel is wired, which is what decides whether the fix for an inverted
+     * wheel is BOARD_MOTOR_RIGHT_INVERT or the left channel's pin swap. */
+    bench_duty_l = (int8_t)BENCH_DUTY_PCT;
+    bench_duty_r = 0;
+    bench_deadline_ms = HAL_GetTick() + BENCH_HOLD_MS;
+    dbg_printf("[bench] LEFT channel only %d%% for %lu ms\r\n",
+               (int)BENCH_DUTY_PCT, (unsigned long)BENCH_HOLD_MS);
+  }
+  else if ((ch == (uint8_t)'r') || (ch == (uint8_t)'R'))
+  {
+    bench_duty_l = 0;
+    bench_duty_r = (int8_t)BENCH_DUTY_PCT;
+    bench_deadline_ms = HAL_GetTick() + BENCH_HOLD_MS;
+    dbg_printf("[bench] RIGHT channel only %d%% for %lu ms\r\n",
                (int)BENCH_DUTY_PCT, (unsigned long)BENCH_HOLD_MS);
   }
   else if ((ch == (uint8_t)'x') || (ch == (uint8_t)'X'))
   {
     /* Only clears the request: the PID task performs the actual motor_stop()
      * on its next 10 ms cycle, so the motor keeps a single owner. */
-    bench_duty = 0;
+    bench_duty_l = 0;
+    bench_duty_r = 0;
     dbg_printf("[bench] stop requested\r\n");
+  }
+  else if ((ch == (uint8_t)'c') || (ch == (uint8_t)'C'))
+  {
+    /* Zero the odometry.  Deliberately NOT done here: the Pose task owns the
+     * encoder counters (CODING_STANDARDS 0.3), so this only raises a request and
+     * the Pose task performs pose_reset() at the top of its next cycle.  That is
+     * the difference between a clean zero and a torn 32-bit total. */
+    g_pose_reset_req = 1U;
+    dbg_printf("[enc] zero requested (pose + both encoder totals)\r\n");
+  }
+  else if ((ch == (uint8_t)'e') || (ch == (uint8_t)'E'))
+  {
+    /* Raw encoder readout for the 1.000 m calibration and the direction check.
+     * Reads the software totals, which only the Pose task writes; a single
+     * aligned 32-bit read cannot tear, so no lock is needed for a display. */
+    pose_t p;
+    imu_sample_t s;
+
+    pose_get(&p);
+    imu_get(&s);
+    dbg_printf("[enc] L=%ld R=%ld cnt | rpm %d/%d | x=%ld y=%ld | h=%ld gyro=%ld (x0.1deg)\r\n",
+               (long)encoder_left_total(), (long)encoder_right_total(),
+               (int)encoder_left_rpm(), (int)encoder_right_rpm(),
+               (long)lroundf(p.x_mm), (long)lroundf(p.y_mm),
+               (long)lroundf(p.heading_deg * 10.0f),
+               (long)lroundf(s.heading_deg * 10.0f));
   }
   else if ((ch == (uint8_t)'h') || (ch == (uint8_t)'H') || (ch == (uint8_t)'?'))
   {
-    dbg_printf("[cmd] s=stop lidar  g=restart lidar  f=bench fwd  "
-               "b=bench rev  x=bench stop  h=help\r\n");
+    dbg_printf("[cmd] s=stop lidar g=restart lidar f/b=both fwd/rev "
+               "l/r=left/right only x=stop c=zero enc e=read enc h=help\r\n");
   }
   else
   {

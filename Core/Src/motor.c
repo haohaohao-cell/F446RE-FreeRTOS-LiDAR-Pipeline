@@ -236,7 +236,7 @@ void motor_init(void)
   g.Mode      = GPIO_MODE_AF_PP;
   g.Pull      = GPIO_PULLDOWN;
   g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
-  g.Alternate = GPIO_AF2_TIM4;
+  g.Alternate = BOARD_MOTOR_AF;
   g.Pin       = (uint16_t)(BOARD_MOTOR_L_PIN | BOARD_MOTOR_R_PIN);
   HAL_GPIO_Init(BOARD_MOTOR_L_PORT, &g);
 
