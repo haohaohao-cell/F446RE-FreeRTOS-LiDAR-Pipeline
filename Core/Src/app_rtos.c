@@ -300,6 +300,16 @@ static uint8_t           bench_latched;     /* duty is currently applied    */
  * encoder counters (see the single-owner comment at the 'c' handler). */
 static volatile uint8_t  g_pose_reset_req;
 
+/* TEMPORARY bring-up counters (read over SWD; not printed anywhere).  They
+ * exist to answer "which branch of the tracking loop actually ran" without
+ * guessing from the 1 Hz line.  Remove once the path tracking is validated. */
+static volatile uint32_t dbg_cycles;     /* PID task iterations               */
+static volatile uint32_t dbg_stop_ev;    /* STOP event consumed               */
+static volatile uint32_t dbg_newpath_ev; /* NEW_PATH event consumed           */
+static volatile uint32_t dbg_pops;       /* successful q_path gets            */
+static volatile uint32_t dbg_arrived;    /* waypoint judged already reached   */
+static volatile uint32_t dbg_track;      /* tracking law executed             */
+
 /* ========================================================================== */
 /* Task 1: PID + Motor (10 ms)                                                */
 /* ========================================================================== */
@@ -320,20 +330,32 @@ static void pid_motor_task(void *argument)
     tick += APP_PERIOD_FAST_MS;
     timing_begin(APP_TIMING_PID_MOTOR, APP_PERIOD_FAST_MS * 1000U);
 
-    /* Consume the one-shot navigation notifications.  Both bits are requested in
-     * one call and tested bitwise: osEventFlagsWait() returns the whole flag
-     * word, so comparing the result against a single bit with == would drop a
-     * STOP that arrived together with NEW_PATH - and a dropped STOP means the
-     * car keeps driving. */
+    /* Consume the one-shot navigation notifications.
+     *
+     * THE TRAP: osEventFlagsWait() returns the flag word on success but a
+     * NEGATIVE osStatus_t on "nothing pending" (osErrorResource = -3 =
+     * 0xFFFFFFFD, or osErrorTimeout = -2 = 0xFFFFFFFE when a timeout was given).
+     * Those error codes live in the same uint32_t as the flags, and
+     * 0xFFFFFFFD & 0x0001 == 1, so testing the result with & alone reports a
+     * STOP on every single call - which is exactly what happened on hardware:
+     * stop_ev == cycles, the motor was stopped every cycle and the car never
+     * moved.  Any CMSIS-RTOS2 error code has bit31 set, while event flags only
+     * use the low 24 bits, so mask the error case away first. */
     nav_flags = osEventFlagsWait(evt_nav,
                                  (uint32_t)APP_NAV_EVT_STOP | (uint32_t)APP_NAV_EVT_NEW_PATH,
                                  osFlagsWaitAny, 0U);
+
+    if ((nav_flags & 0x80000000U) != 0U)
+    {
+      nav_flags = 0U;   /* error code, not a flag word: nothing happened */
+    }
 
     if ((nav_flags & (uint32_t)APP_NAV_EVT_STOP) != 0U)
     {
       have_wp = 0U;
       stopped = 1U;
       motor_stop();
+      dbg_stop_ev++;
     }
     else if ((nav_flags & (uint32_t)APP_NAV_EVT_NEW_PATH) != 0U)
     {
@@ -343,6 +365,7 @@ static void pid_motor_task(void *argument)
        * queue get below takes the new first waypoint in this same cycle, so
        * there is no unnecessary brake between retargets. */
       have_wp = 0U;
+      dbg_newpath_ev++;
     }
 
     /* ---- bench burst: open-loop drive, wheels off the ground -------------- */
@@ -371,12 +394,14 @@ static void pid_motor_task(void *argument)
       pose_t pose;
 
       pose_get(&pose);
+      dbg_cycles++;
 
       /* 1. Is the waypoint we are following already reached? */
       if ((have_wp != 0U) && (path_arrived(&pose, &wp) != 0U))
       {
         path_note_reached();
         have_wp = 0U;
+        dbg_arrived++;
 
         if (path_is_final(&wp) != 0U)
         {
@@ -395,6 +420,7 @@ static void pid_motor_task(void *argument)
         {
           uint32_t depth = osMessageQueueGetCount(q_path);
 
+          dbg_pops++;
           if (depth > rtos_stats.q_path_peak)
           {
             rtos_stats.q_path_peak = depth;
@@ -424,6 +450,7 @@ static void pid_motor_task(void *argument)
         path_track_step(&pose, &wp, &rpm_l, &rpm_r);
         motor_set_target_rpm(rpm_l, rpm_r);
         stopped = 0U;
+        dbg_track++;
 
         /* One PID step, one CCR write - never split across a blocking call
          * (CODING_STANDARDS 1.2.2).  The feedback is the value the Pose task
