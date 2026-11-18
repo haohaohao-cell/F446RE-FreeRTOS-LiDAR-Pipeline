@@ -1,4 +1,4 @@
-# nav_run.ps1
+﻿# nav_run.ps1
 #
 # Role 6 evidence: run the car to a commanded (x, y) and record the endpoint
 # error, automatically, one target at a time.
@@ -28,6 +28,7 @@
 # Usage (or use nav_run.cmd):
 #     tools\nav_run.ps1                      the three acceptance targets
 #     tools\nav_run.ps1 -Only 0,1400         just the first one
+#     tools\nav_run.ps1 -PauseSec 20          all three, with time to carry the car back
 #     tools\nav_run.ps1 -Simulate            no hardware; proves the logic only
 #     tools\nav_run.ps1 -SelfTest            parser check, no hardware
 [CmdletBinding()]
@@ -35,6 +36,7 @@ param(
     [string]$DebugPort = 'COM8',
     [string]$BtPort = 'COM10',
     [int]$TimeoutSec = 60,
+    [int]$PauseSec = 0,
     [string]$Only = '',
     [string]$Csv = '',
     [switch]$Simulate,
@@ -443,9 +445,20 @@ if ($Simulate) {
 $results = New-Object System.Collections.ArrayList
 $rc = 0
 try {
+    $k = 0
     foreach ($t in $TARGETS) {
+        $k++
         [void]$results.Add((Invoke-Run $t))
         Pump -Ms 400
+        if (($PauseSec -gt 0) -and ($k -lt $TARGETS.Count)) {
+            # The car is now somewhere else; every run zeroes the pose with 'c',
+            # so it must be carried back to the start point before the next one.
+            Write-Host ''
+            for ($s = $PauseSec; $s -gt 0; $s--) {
+                Write-Host ("  put the car back on the start mark, facing +y ... {0}s" -f $s) -ForegroundColor Yellow
+                Start-Sleep -Seconds 1
+            }
+        }
     }
 } catch {
     Write-Host ('  ERROR: {0}' -f $_.Exception.Message) -ForegroundColor Red
