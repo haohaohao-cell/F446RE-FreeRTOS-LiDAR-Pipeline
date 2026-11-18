@@ -1,282 +1,258 @@
-# F446RE FreeRTOS 激光雷达流水线
+# F446RE 双轮差速导航小车（Block 4.5 Part 2）
 
-Block 4.5 Coding Day —— 基于 **STM32F446RE + FreeRTOS 10.3.1（CMSIS-RTOS v2）**
-的中断驱动 RPLidar C1 数据流水线。
+**STM32F446RE + FreeRTOS 10.3.1（CMSIS-RTOS v2）**。
+蓝牙给目标坐标，车自己规划路点、用编码器 + 陀螺闭环走到点。
 
-DMA 把循环缓冲对半填，中断只负责宣告哪一半就绪，解析任务直接从 DMA 缓冲区读这一块
-解析，第二个任务负责打印/发送。**中断里不做任何解析。**
+> **一句话成绩**：蓝牙下令走 1.4 m，**卷尺实测误差 10 mm 以内**，航向偏差 1.2°；
+> 8 个线程并发，10 ms 控制环的最坏执行时间 11 µs，超时计数 0。
 
 *English version: [README.md](README.md).*
+
+---
+
+## 这是什么
+
+课程 Block 4.5 的第二部分（Part 1 是纯分析的雷达流水线，那个流水线在这里**仍然活着**，
+是 8 个线程里的第 4/6/7 个，也是队列与信号量评分点的证据来源）。
+
+| 评分角色 | 本工程对应 | 证据 |
+|---|---|---|
+| 1 完整应用 | 8 线程 + 蓝牙 + 3 队列 | 1 Hz 状态行（除 OLED 外全部并发） |
+| 2 任务调度 | `osDelayUntil` + 实测计时 | 周期/抖动/WCET/超时计数 |
+| 3 消息队列 | `Q_Lidar` / `Q_Cmd` / `Q_Path` | 峰值占用 + 溢出计数 |
+| 4 信号量 | TIM6 → IMU 任务 | 实测 100 Hz |
+| 5 互斥量 | I2C1 + `osMutexPrioInherit` | 持锁 1.5 ms + `i` 键继承对比 |
+| 6 蓝牙导航 | BT → 路径 → PID → 电机 | 三趟地面的端点/航向误差 |
 
 ---
 
 ## 架构
 
 ```
-        USART3 + DMA1_Stream1（循环，2048 B = 2 × 1024 B）
-                         |
-     半满中断  -> lidar_on_half()      --+
-     全满中断  -> lidar_on_full()      --+--> Queue 1（8 × 12 B 描述符）
-     串口错误  -> lidar_on_uart_error()+             |
-                                                     | osMessageQueueGet()
-                                                     v
-                                      LiDAR 解析任务（osPriorityAboveNormal）
-                                                     |
-                                   +-----------------+------------------+
-                                   |                                    |
-                      360 格扫描图（共享）                  Queue 2（4 × 44 B 结果）
-                      ≈8 Hz 遥测帧                                      |
-                                                                        v
-                                                    输出/调试任务（osPriorityNormal）
-                                                           |                     |
-                                                  USART2 文本 115200     UART5 二进制 230400
-                                                           |                     |
-                                                  ST-Link 虚拟串口(COM8)    HC-04 蓝牙(COM10)
+     蓝牙 COM10 ──"G 0 1400\n"──> UART5 ──DMA1_S0──> bt_rx.c ──信号量──> BT RX 任务
+                                                                          │ Q_Cmd (4×8B, 满则覆盖最旧)
+                                                                          v
+                                                                   PathGen 任务（100 mm 步长）
+                                                                          │ Q_Path (16×8B, 生产方阻塞)
+                                                                          v
+   TIM1/TIM8 硬件 QEP ──> Pose 任务 ────────────────────────────────> PID+Motor 任务（10 ms）
+   MPU-6500 ──I2C1(互斥量)──> imu.c 陀螺 ──> pose.c                         │ 一次算完一次写 CCR
+                                                                          v
+                                                              TIM4 / TIM2 H 桥 ──> 左右轮
+
+   RPLidar C1 ──USART3+DMA(循环 2×1024B)──> lidar.c ──> Q_Lidar (8×12B, 满则丢) ──> LiDAR 任务
+   BT TX / OLED 任务：50 ms 周期，输出 1 Hz 状态块 + 二进制遥测 + 分页显示
 ```
+
+**8 个线程**（优先级：数大者优先）：
+
+| # | 线程 | 优先级 | 栈 | 周期/触发 | 调度 |
+|---|---|---|---|---|---|
+| 1 | `pidMotor` | 40 | 1024 | 10 ms | `osDelayUntil` |
+| 2 | `imuAcq` | 37 | 1024 | 10 ms | 计数信号量（TIM6） |
+| 3 | `pose` | 36 | 768 | 10 ms | `osDelayUntil` |
+| 4 | `lidarProc` | 34 | 1536 | ~22 ms/块 | `Q_Lidar`（100 ms 守卫） |
+| 5 | `pathGen` | 30 | 1024 | 命令到达 | `Q_Cmd` |
+| 6 | `btRx` | 28 | 768 | 字节到达 | 计数信号量 |
+| 7 | `btTx` | 22 | 1024 | 50 ms | `osDelayUntil` |
+| 8 | `oled` | 20 | 2048 | 50 ms | `osDelayUntil` |
+
+> **编码器不是线程**（TIM1/TIM8 硬件正交解码，Pose 每 10 ms 读一次 CNT）；
+> **PID 与电机合并成一个任务**（setpoint 变成任务内局部变量，零延迟）。
+> 这就是 PPT 的 10 行参考表为什么在实现里是 8 个线程。
 
 ---
 
-## 实测数据（真实硬件）
+## 实测数据（目标板，2026-11-17 / 11-18）
 
-| 指标 | 数值 | 看哪个字段 |
+| 指标 | 实测 | 看哪个字段 |
 |---|---|---|
-| DMA 块速率 | **25–26 块/秒**（半缓冲 40 ms） | `blk` |
-| Queue 1 峰值占用 | **0 / 8** | `q1` —— 解析任务从没落后 |
-| 中断 → 任务延迟 | **12–15 µs** | `lat` / `latmax` |
-| 每块解析耗时 | **约 800 µs**（`-O0`）= 块周期的 2% | `parsemax` |
-| 雷达字节率 | **24.9–25.3 kB/s**，约 5 100 包/秒 | `L`，与 C1 手册吻合 |
-| 帧错误 / 重同步 / 串口错误 | **0 / 0 / 0**（约 100 万包） | `inv` / `slip` / `err` |
-| FreeRTOS 堆 | 32 KB 用 6.2 KB，`free == min`（无泄漏） | `heap` |
-| 任务栈剩余 | 解析 1256 B / 输出 784 B | `stk` |
-| HAL tick 与内核 tick | **1.000 : 1** | `hal` / `k` |
+| 电机任务周期 / 抖动 / WCET | **10.00 ms / 42 µs / 11 µs**（预算 700 µs） | `M: per/jit/wc` |
+| 周期任务超时计数 | **0** | `ov m0 p0` |
+| IMU 采样率 | **100 /s** | `IMU:` |
+| I2C 最长持锁 | **1.5 ms**（目标 <3 ms） | `hold` |
+| LiDAR 流水线 | **24–25 块/s**，`Q_Lidar` 峰值 0/8 | `blk` / `q` |
+| 堆 | **19 816 / 32 768 B** | `H:` |
+| 栈剩余（8 个） | 680 / 504 / 464 / 1280 / 768 / 576 / 636 / 1096 B | `STK:` |
+| 失败计数器 | 全 0（`ql qc qpt imu bt log iw`） | `CNT:` |
+| **导航 1.4 m 直线** | 固件 **12 mm / 0.9 %**；卷尺 **≤10 mm**；航向 +1.2°；13.2 s | `nav_run` 表 |
+| 导航 (−0.70, 0.70) | 固件 18 mm / 1.8 %；卷尺 52 mm（含 45° 原地转） | 同上 |
+| 导航 (0.70, −0.70) | 固件 14 mm / 1.5 %；卷尺 >30 mm（含 135° 原地转） | 同上 |
+| 左右轮对称性 | R/L **1.03 / 1.14**（修复前 1.80 / 4.74） | `bench_p0 -Test symmetry` |
+| 优先级继承 | 持锁者优先级 **11 → 13**（mutex）/ 11（信号量） | `i` 键 |
 
-完整分析（架构论证、块大小选择、队列消息设计、中断优先级规则、三个"只有上板才会
-暴露"的 bug）见 [`Docs/Block4.5_Design_Report_CN.docx`](Docs/Block4.5_Design_Report_CN.docx)。
+原始日志在 `tools/logs/`（`serial_*` 1 Hz 行、`bench_*` 台架、`nav_*` 导航 + CSV）。
+完整分析见 [`Docs/Block4.5_Part2_Design_Report_CN.docx`](Docs/Block4.5_Part2_Design_Report_CN.docx)。
 
 ---
 
 ## 硬件
 
-| 项目 | 说明 |
+| 项目 | 连接 |
 |---|---|
-| MCU | STM32F446RE（兼容 Nucleo-F446RE），168 MHz，128 kB SRAM |
-| 雷达 | RPLidar C1，SCAN 模式，USART3 @ **460 800** 8N1（PC10 TX / PC11 RX） |
-| 雷达 DMA | DMA1_Stream1，循环模式，2048 B |
-| IMU（可选） | MPU-6500，I2C1（PB8 SCL / PB9 SDA），TIM6 以 100 Hz 采样 |
-| 蓝牙（可选） | HC-04 接 UART5 @ 230 400，承载二进制遥测 |
-| 调试串口 | USART2 @ 115 200（PA2 / PA3）→ ST-Link 虚拟串口 |
-| HAL 时基 | TIM7 @ 1 kHz（TIM6 已被 IMU 占用） |
+| MCU | NUCLEO-F446RE，168 MHz，128 kB SRAM |
+| 右轮电机 / 编码器 | **PB6 / PB7**（TIM4 CH1/CH2，极性反，由 `RIGHT_INVERT` 补偿）/ **PA8 / PA9**（TIM1 QEP） |
+| 左轮电机 / 编码器 | **PA0 / PA1**（TIM2 CH1/CH2）/ **PC6 / PC7**（TIM8 QEP） |
+| IMU | MPU-6500，I2C1（PB8/PB9），0x68 |
+| 蓝牙 | HC-04，UART5（PC12/PD2），Windows SPP = **COM10** |
+| 调试串口 | USART2（PA2/PA3）→ ST-Link 虚拟串口 **COM8** @115 200 |
+| 雷达 | RPLidar C1，USART3 @460 800 + DMA1_Stream1（PC10/PC11） |
+| OLED | SSD1306 走 I2C1（0x3C）—— **驱动已写，面板未接**（`oled=-3`） |
 
-雷达这条路可以单独工作；IMU 和蓝牙是可选的，没接只会表现为 `IMU 0` / 没有点云数据。
+引脚/定时器/NVIC 的**唯一真源**是 [`Core/Inc/board_pins.h`](Core/Inc/board_pins.h)，不要在别处写死数字。
+
+> ⚠️ **不要交换右电机的两根动力线**：固件里的 `BOARD_MOTOR_RIGHT_INVERT=1` 已经补偿过了，
+> 换线会双重取反。
+
+---
+
+## 快速开始
+
+### 1. 编译
+
+`make` 不在 PATH 里，先加 CubeIDE 的 make 与 arm-none-eabi：
+
+```powershell
+$env:PATH = "D:\CubeIDE\STM32CubeIDE_2.1.1\STM32CubeIDE\plugins\com.st.stm32cube.ide.mcu.externaltools.make.win32_2.2.100.202601091506\tools\bin;D:\CubeIDE\STM32CubeIDE_2.1.1\STM32CubeIDE\plugins\com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.14.3.rel1.win32_1.0.100.202602081740\tools\bin;" + $env:PATH
+```
+
+```cmd
+make -C Debug -j8 all
+```
+
+要求 **0 warning / 0 error**，基线 **text = 90 244 B**。
+
+### 2. 烧录 + 抓串口
+
+```cmd
+tools\flash_and_monitor.cmd              :: 探测 → 烧录 → 校验 → 抓 15 s
+tools\flash_and_monitor.cmd -Probe       :: 只探测（区分"没插 ST-Link"和"板子没电"）
+tools\serial_console.cmd                 :: 实时终端（s/g/f/b/l/r/x/c/e/i/h）
+```
+
+### 3. 让车走
+
+```cmd
+:: 有线（调试用：同时开 COM8 + COM10，自动读回终点位姿）
+tools\nav_run.cmd -Only 0,1400
+
+:: 无线（验收用：只走蓝牙，终点用卷尺量）
+tools\bt_send.cmd "G 0 1400"
+```
+
+车头方向约定：**+y 是车头向前，+x 是车的右侧**，坐标单位 mm，范围 ±5000。
+
+---
+
+## 控制台与命令
+
+**COM8 @115 200**（USART2）：
+
+| 键 | 作用 |
+|---|---|
+| `s` / `g` | 停 / 重启激光（旧功能，未破坏） |
+| `f` / `b` | 两轮正/反转 40%，1.5 s 自动停 |
+| `l` / `r` | 只驱动左/右通道 40%，1.5 s |
+| `x` | 立即请求停止 |
+| `c` | 位姿 + 两路编码器清零（由 Pose 任务执行，保证不撕裂） |
+| `e` | 读 `L= R= cnt \| rpm \| x y \| h gyro` |
+| `i` | **角色 5：优先级继承对比演示** |
+| `h` / `?` | 帮助 |
+
+**COM10 @115 200**（蓝牙，一行一条）：`G <x_mm> <y_mm>` / `S` / `P` / `?`
+
+> 点动占空比是 **40%**，不是 20%：实测这块电池在 20–30% 是死区（两轮都不转）。
+
+---
+
+## 输出怎么读
+
+每秒 7 行，前缀固定 `[1s]`：
+
+```
+[1s] L: blk24 q0/8 p2435 | M: per10.00 jit42 wc11 | C: q0/4
+[1s] P: eh90.0 ex0 ey0 | QP: 0 | PATH: g0 r0
+[1s] I2C: ok1401 err1 hold1.5ms | H: 19816/32768 | WD: 0 | IMU: 100/s
+[1s] STK: 680 504 464 1280 768 576 636 1096
+[1s] T10: m10.00/42/11 p11.38/1383/12 | ov m0 p0
+[1s] T50: b51.26/1267/281 o51.09/1100/285 | ov b0 o0
+[1s] CNT: ql0 qc0 qpt0 imu0 bt(s0 r0 o0 u0) log0 iw0
+```
+
+| 行 | 意思 |
+|---|---|
+| 1 | 激光块速率 / `Q_Lidar` 峰值 / 最坏解析耗时；电机任务 周期·抖动·WCET；`Q_Cmd` 深度 |
+| 2 | 位姿：航向 `eh`（×0.1°）、`ex`/`ey`（mm）；`Q_Path` 深度；路径**累计**生成/到达数 |
+| 3 | I2C 成功/失败/最长持锁；堆；看门狗（未启用）；IMU 实测采样率 |
+| 4 | 8 个任务栈剩余（顺序：PID/IMU/Pose/LiDAR/Path/BTRX/BTTX/OLED） |
+| 5–6 | 4 个周期任务的 周期/抖动/WCET + 超时计数 |
+| 7 | 失败计数器，**全 0 才是健康** |
+
+> `Pose` 周期显示 11.38 ms 而不是 10 ms：它被 IMU 任务里那次阻塞 I2C（≤1.5 ms）挤了。
+> 设计使然，写进了报告的"不好看的数字"一节。
+
+---
+
+## 演示
+
+- 一页纸：[`Docs/Block4.5_Part2_Demo_Flowcard_CN.docx`](Docs/Block4.5_Part2_Demo_Flowcard_CN.docx)
+- 完整脚本（含 12 个问答）：[`Docs/Block4.5_Part2_Demo_Script_CN.docx`](Docs/Block4.5_Part2_Demo_Script_CN.docx)
+
+---
+
+## 踩过的坑（每个都会在重写时复现）
+
+| # | 症状 | 根因 | 修法 |
+|---|---|---|---|
+| A | 打印 7 行后整车假死，但 TIM7 还在跳 | 栈溢出钩子设 BASEPRI=0x50，屏蔽不掉优先级 0 的 TIM7 | 栈 512→1024 / 1024→2048 |
+| B | `G` 生成了路点但车不动 | `osEventFlagsWait` 无事件返回 `0xFFFFFFFD`，`&1 == 1` 被当成 STOP | 先判 `flags & 0x80000000` |
+| C | `f` 时右轮倒转，车原地打转 | 电机在 PB6/PB7 上但装的是右轮，且极性反 | `board_pins.h` 左右对调 + `RIGHT_INVERT` |
+| D | 速度只有目标的 28% | 积分限幅 120 × ki 0.15 = 2% 输出，积分等于禁用 | kp/ki/限幅一起改 |
+| E | `G` 之后队列为空 | 测试脚本的 `S` 晚到，清掉了新路径 | 等命令送达再关串口 |
+| F | 右轮正转 0.5×、反转 4.7× | 编码器 QEP 输入滤波 190 ns 太短，碳刷噪声被当边沿 | 滤波改 3 µs（`encoder.c`） |
+| G | 1.4 m 的路 1.2 s 就判"完成" | `PATH: g/r` 是开机累计值，不是本趟进度 | 判据改为 `QP==0` + 位姿在目标附近 |
+
+根因分析、定位过程与实测数据见报告 §11。
 
 ---
 
 ## 目录结构
 
 ```
-Core/               应用代码
-  Src/app.c           启动顺序、NVIC 优先级表、HAL 回调
-  Src/app_rtos.c      队列、解析任务、输出任务、控制台命令
-  Src/lidar.c         C1 驱动：中断投递描述符、逐块解析、流看门狗
-  Src/stm32f4xx_hal_timebase_tim.c   HAL tick 移到 TIM7 + DWT 校准
-  Inc/FreeRTOSConfig.h               内核配置
-  Inc/app_rtos.h, lidar.h            队列/任务尺寸、消息结构体
-Middlewares/Third_Party/FreeRTOS/    FreeRTOS 10.3.1 + CMSIS-RTOS v2 + heap_4
-Drivers/                             ST HAL + CMSIS（CubeF4 1.28.3）
-pc_app/             PC 端
-  main.py             matplotlib 点云查看器（解二进制遥测）
-  run_viewer.cmd      一键启动
-tools/              辅助脚本
-  flash_and_monitor.cmd   探测 → 烧录 → 校验 → 抓串口 → 自动判读
-  serial_console.cmd      实时终端，可敲 s / g / h
-Docs/               报告 + 演示材料（中英双份，.md 和 .docx）
-CodingDay_F446RE.ioc, .cproject     STM32CubeIDE 工程文件
+Core/Src/app_rtos.c     8 线程、3 队列、1 Hz 状态行、角色 5 演示
+Core/Src/app.c          启动顺序、NVIC 优先级表、HAL 回调分发
+Core/Src/motor.c        TIM4/TIM2 PWM + 双轮 PID
+Core/Src/encoder.c      TIM1/TIM8 硬件 QEP（3 µs 输入滤波）
+Core/Src/pose.c         里程计 + 陀螺航向（陀螺优先，轮式兜底）
+Core/Src/path.c         100 mm 路点生成 + 航向控制律
+Core/Src/imu.c          MPU-6500，任务上下文采样
+Core/Src/i2c_bus.c      I2C1 唯一所有者：prio-inherit 互斥量 + 有界事务
+Core/Src/oled.c         SSD1306 + 6x8 字库（未上过真面板）
+Core/Inc/board_pins.h   引脚/定时器/NVIC 唯一真源
+tools/                  bench_p0 / nav_run / bt_send / flash_and_monitor / serial_console
+tools/host_tests/       主机侧单元测试（解析语法、路点生成、跟踪律）
+Docs/                   报告、演示脚本、编码规范、交接文档
 ```
-
----
-
-## 快速开始
-
-### 1. 克隆
-
-```bash
-git clone https://github.com/haohaohao-cell/F446RE-FreeRTOS-LiDAR-Pipeline.git
-```
-
-### 2. 编译
-
-**用 STM32CubeIDE（推荐）**
-
-1. *File → Import → General → Existing Projects into Workspace*
-2. 选克隆下来的 `F446RE-FreeRTOS-LiDAR-Pipeline` 目录，工程 `CodingDay_F446RE` 会出现
-3. **Project → Build Project**（Ctrl+B）
-
-预期：**0 warning、0 error**，约 55 kB Flash、42 kB RAM。
-
-> FreeRTOS 的 include 路径已经写进 `.cproject`，不需要再配置任何东西。
-> **不要**打开 `.ioc` 按 Generate Code —— 见下面「坑」。
-
-**命令行**（可选 —— 必须先让 STM32CubeIDE 生成过一次 `Debug/`）
-
-```bash
-make -C Debug -j8 all
-```
-
-`Debug/` 是纯编译产物，已被 git 忽略，里面那些 makefile 是 CubeIDE 生成的。
-所以**第一次编译必须在 IDE 里做**（Ctrl+B），之后命令行也能用。
-
-### 3. 烧录
-
-```cmd
-tools\flash_and_monitor.cmd
-```
-
-它会先确认 ST-Link 能看到目标板，然后烧 `Debug\CodingDay_F446RE.elf`、校验、复位，
-再抓 15 秒调试串口并自动给健康判定。
-
-* 只想看板子通不通：`tools\flash_and_monitor.cmd -Probe`
-* 工具链装在别处：`-Cli "C:\路径\STM32_Programmer_CLI.exe"`
-* 不烧只监听：`-NoFlash -Seconds 30`
-
-### 4. 看它跑 —— 两条互相独立的链路
-
-| 看什么 | 命令 | 端口 |
-|---|---|---|
-| **文本终端**（`blk`、`idle`、`q1`、`lat`、`heap`、`stk`） | `tools\serial_console.cmd` | COM8 @ 115200 |
-| **点云图**（二维扫描 + 航向盘） | `pc_app\run_viewer.cmd` | COM10 @ 115200（蓝牙） |
-
-两者可以同时开 —— 它们是不同的物理链路。
-
-终端是**可交互**的：
-
-| 按键 | 作用 |
-|---|---|
-| `s` | 停止雷达（不用碰任何线） |
-| `g` | 重新启动 |
-| `h` / `?` | 帮助 |
-| `Esc` / `Ctrl+C` | 退出 |
-
-点云查看器需要 `matplotlib`、`pyserial`、`tkinter`：
-
-```bash
-py -3 -m pip install matplotlib pyserial
-```
-
-端口不是 COM10 的话，用 `pc_app\run_viewer.cmd -l` 列出来，或者
-`run_viewer.cmd COM7` 指定。`run_viewer.cmd --sim` 可以用合成数据跑，
-**完全不需要硬件**。
-
----
-
-## 输出怎么读
-
-**每块一行**（`#`，约 8 Hz）
-
-```
-#0474 p205 ok151 nr54 iv0 n115 d[47..10574] lat12 p765 S 255 78 36 8 4 255 255 255
-```
-
-| 字段 | 含义 |
-|---|---|
-| `#0474` | 块序号 —— 出现跳变说明丢了描述符 |
-| `p205` | 本块解出的 5 字节包数 |
-| `ok151 / nr54 / iv0` | 有效 / 无回波 / 帧错误 |
-| `n115` | 本块触及的不同角度格数 |
-| `d[47..10574]` | 本块最小 / 最大距离，mm |
-| `lat12` | **中断 → 解析任务唤醒延迟**，µs |
-| `p765` | 本块解析耗时，µs |
-| `S ...` | 8 扇区障碍摘要，cm（255 = 无回波） |
-
-**每秒一行**（`[1s]`）
-
-```
-[1s] blk 25/447 q1 0/8 q2 1/4 idle 5 latmax 14 parsemax 801 | L 25259B/s
-     pkt 91541 inv 0 nr 17495 sync 1 slip 0 err 0 cmd 1/0 | IMU 0 err 0
-     | BT f 161 dr 0 | heap 26488 min 26488 | stk 1256/784 | hal 1054 k 1053
-```
-
-| 字段 | 含义 | 正常值 |
-|---|---|---|
-| `blk` | 最近一秒块数 / 累计块数 | 约 25 /秒 |
-| `q1` | Queue 1 **峰值**占用 | 0–1（到 8 说明解析跟不上了） |
-| `q2` | Queue 2 峰值占用 | 0–2 |
-| `idle` | Queue 1 等待超时次数 | 很小且稳定不变 |
-| `latmax` | 最坏中断→任务延迟 | < 50 µs |
-| `parsemax` | 最坏解析耗时 | < 1 000 µs |
-| `L` | 实测雷达字节率 | 约 25 000 B/s |
-| `sync` | 抓到 SCAN 描述符的次数 | 1（重新锁定流时会增加） |
-| `cmd` | 已发 SCAN 命令数 / 看门狗判定丢流次数 | `1 / 0`（只有传感器掉线才会涨） |
-| `err` | 串口错误 | 0 |
-| `heap` | 堆剩余 / 历史最低剩余 | 两者相等（无泄漏） |
-| `stk` | 栈高水位**剩余**，解析 / 输出 | 都 > 500 B |
-| `hal` / `k` | 同一秒内 HAL tick 与内核 tick 的增量 | 1:1 |
-
----
-
-## 演示「掉线又恢复」（最关键的 60 秒）
-
-这一段用来证明设计是**队列驱动**而不是轮询。
-
-1. 在终端窗口敲 **`s`**
-   * `blk` → 0，`L` → 0 B/s，`idle` 开始涨（每 100 ms 一次超时）
-   * **系统不卡死**：两个任务都还响应，1 Hz 行照常打印
-2. 等 5 秒，敲 **`g`**
-   * `cmd` 会跳（`3/0 → 4/1 → 5/2`）：看门狗发现超过 1 秒没有 DMA 块，重发了 SCAN
-   * 约 3 秒内 `blk` 回到 25、`idle` 停住、`sync` 从 1 变 2
-
-为什么重要：RPLidar C1 **上电后不会自己开始输出**，它永远需要再收到一次
-`0xA5 0x20` SCAN 命令。如果用 `osWaitForever` 死等队列，这里就永久死锁了。
-100 ms 的保护超时正是让解析任务能跑起来跑看门狗的原因。
-
-拔雷达线也能演示同样的事，但敲 `s` 不会弄坏硬件 —— 现场演示建议用这个。
-
----
-
-## 坑
-
-* **两个不同的 COM 口。** COM8 是 ST-Link 虚拟串口 = 文本调试（USART2）；
-  COM10 是蓝牙 SPP = 二进制遥测（UART5）。`blk` / `idle` **只在 COM8** 上；
-  点云窗口只显示二进制流。
-* **Windows 下蓝牙 SPP 串口最高只能开 115200。** 固件实际以 230 400 发送，
-  但 SPP 的波特率只是名义值 —— 查看器用 115200 打开，不会被限速
-  （实测遥测吞吐约 6.4 kB/s）。
-* **HAL 时基在启动时用 DWT 校准。** `stm32f4xx_hal_timebase_tim.c` 实测发现本板
-  TIM7 跑在 HCLK（168 MHz）而不是手册推算的 2 × PCLK1（84 MHz），于是改为按
-  `实测/预期` 修正预分频。开机横幅会打印 `timebase: ... calib=40/20` 和
-  `50 ms (dwt) -> 50 ms (hal) OK`。**如果 tick 不对，所有 `HAL_GetTick()` 超时和
-  所有测出来的字节率都会按同一比例出错** —— 先看这一行。
-* **不要在 STM32CubeMX 里按 Generate Code。** `.ioc` 里没有 FreeRTOS 的 IP
-  （为了避免写坏工程而刻意没有注入），重新生成会重写 `.cproject`，把 FreeRTOS 的
-  include 路径和 `Middlewares` 源目录冲掉。真要重新生成，必须把这两样、以及 TIM7
-  优先级 0 和启动校准加回去。
-* **IMU 是可选的。** 横幅里的 `imu=-1, err=0x4, who=0x00` 和 1 Hz 行的 `IMU 0`
-  只表示 MPU-6500 没接，不影响雷达流水线。
 
 ---
 
 ## 文档
 
-| 文件 | 内容 |
+| 文档 | 内容 |
 |---|---|
-| `Docs/Block4.5_Design_Report_CN.docx` / `_EN.docx` | 完整分析：架构、块大小论证、队列消息设计、中断优先级规则、实测结果、三个上板才发现的 bug |
-| `Docs/Block4.5_Demo_Flowcard_CN.docx` / `_EN.docx` | 一页演示卡：3 个动作 + 4 人分工表 |
-| `Docs/Block4.5_Demo_Script_CN.docx` / `_EN.docx` | 详细演示脚本 + 答辩问答速查 |
-| `Docs/*.md` | 上面这些的 Markdown 源文件 |
-
-`tools/md2docx.py` 可以从 Markdown 重新生成 `.docx`（需要 `python-docx`）：
-
-```bash
-py -3 tools/md2docx.py Docs/Block4.5_Design_Report_CN.md Docs/out.docx --lang cn
-```
+| `Docs/Block4.5_Part2_Design_Report_CN.docx` | **设计报告**：架构论证、实测、七个 bug |
+| `Docs/Block4.5_Part2_Demo_Script_CN.docx` | 现场演示脚本 + 问答 |
+| `Docs/Block4.5_Part2_Demo_Flowcard_CN.docx` | 一页纸 |
+| `Docs/CODING_STANDARDS.md` | 铁律、任务表、队列策略、可观测性格式 |
+| `Docs/HANDOVER.md` | 上板实测记录（bug 现场、调试技巧） |
+| `Docs/NEXT_SESSION.md` | 交接：当前状态、待办、时间线 |
 
 ---
 
 ## 第三方组件
 
-| 组件 | 版本 | 许可证 |
-|---|---|---|
-| FreeRTOS 内核 | 10.3.1 | MIT（见 `Middlewares/Third_Party/FreeRTOS/LICENSE`） |
-| CMSIS-RTOS API v2 封装 | 随 CubeF4 1.28.3 | Apache-2.0 |
-| STM32F4 HAL / CMSIS | CubeF4 1.28.3 | BSD-3-Clause（ST） |
+- FreeRTOS 10.3.1 + CMSIS-RTOS v2 封装（ST）
+- STM32F4 HAL
+- `pc_app/`：PC 侧点云查看器（Python + matplotlib，解二进制遥测）
 
-`Core/`、`pc_app/`、`tools/` 里的代码是课程作业，**只作参考**，不要直接当自己的作业交。
+课程示例代码与 PPT **不在本仓库内**，也未提交。
