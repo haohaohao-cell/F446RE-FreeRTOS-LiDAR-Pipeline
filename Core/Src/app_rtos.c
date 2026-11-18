@@ -1,4 +1,4 @@
-/* -----------------------------------------------------------------------------
+﻿/* -----------------------------------------------------------------------------
  * app_rtos.c - the 8-thread architecture (see app_rtos.h for the table).
  *
  * DATA FLOW
@@ -70,6 +70,10 @@ static osThreadId_t t_bt_rx;
 static osThreadId_t t_bt_tx;
 static osThreadId_t t_oled;
 
+/* Defined with the demo itself, near the bottom of this file; the console
+ * handler lives above it and only needs the prototype. */
+static void demo_prio_start(void);
+
 static app_rtos_stats_t rtos_stats;
 
 /* Timing state is kept separate from the published copy so a 1 Hz snapshot can
@@ -123,7 +127,7 @@ static const osSemaphoreAttr_t    sem_bt_attr  = { .name = "semBtRx"   };
 static const osEventFlagsAttr_t   evt_nav_attr = { .name = "evtNav"    };
 
 /* ========================================================================== */
-/* timing helpers (DWT, µs resolution)                                        */
+/* timing helpers (DWT, 纰宻 resolution)                                        */
 /* ========================================================================== */
 static uint32_t cyc_to_us(uint32_t cycles)
 {
@@ -287,7 +291,14 @@ void app_rtos_bt_rx_event(void)
  * no-ops, so the open-loop write is the only motor write in that cycle.  On the
  * cycle the burst ends, bench_latched makes the task call motor_stop() once -
  * without it the last CCR value would keep the wheels turning after 'x'. */
-#define BENCH_DUTY_PCT     20      /* open-loop duty, percent              */
+/* Bench duty.  Was 20 %, which is BELOW THIS PACK'S DEAD BAND: measured
+ * 2026-11-18 by driving the H-bridge inputs straight over SWD, the wheels do not
+ * start at all at 10-20 % and only just move at 30 %; the same 20 % duty did turn
+ * them at 83 rpm on 2026-11-17 (HANDOVER 12.4).  A jog that produces no motion
+ * cannot tell "weak pack" from "dead channel", which is what it exists for, so
+ * the bench burst now runs at 40 % - clearly above the threshold and still only
+ * meant to be used with the wheels off the ground. */
+#define BENCH_DUTY_PCT     40      /* open-loop duty, percent              */
 #define BENCH_HOLD_MS    1500U     /* burst length, milliseconds           */
 
 static volatile int8_t   bench_duty_l;      /* 0 = off, else -100..+100     */
@@ -794,7 +805,13 @@ static void console_poll(void)
   else if ((ch == (uint8_t)'h') || (ch == (uint8_t)'H') || (ch == (uint8_t)'?'))
   {
     dbg_printf("[cmd] s=stop lidar g=restart lidar f/b=both fwd/rev "
-               "l/r=left/right only x=stop c=zero enc e=read enc h=help\r\n");
+               "l/r=left/right only x=stop c=zero enc e=read enc i=prio demo h=help\r\n");
+  }
+  else if ((ch == (uint8_t)'i') || (ch == (uint8_t)'I'))
+  {
+    /* Role 5 evidence.  Raise-and-return: the demo runs in its own low-priority
+     * tasks, so the console (and everyone else) keeps running. */
+    demo_prio_start();
   }
   else
   {
@@ -880,7 +897,7 @@ static uint32_t status_prev_ms;
 static uint32_t status_prev_samples;
 
 /* "period_ms/jitter_us/wcet_us" for one periodic task, as CODING_STANDARDS 1.3
- * requires for EVERY periodic task (the §7 example only shows the motor one). */
+ * requires for EVERY periodic task (the 鎼? example only shows the motor one). */
 static void fmt_timing(char *dst, uint32_t dst_len, uint32_t slot)
 {
   uint32_t per_us = timing_pub[slot].period_us_max;
@@ -1075,6 +1092,247 @@ static void oled_task(void *argument)
 }
 
 /* ========================================================================== */
+/* ========================================================================== */
+/* Role 5 demo: priority inheritance, measured on the holder itself           */
+/* ========================================================================== */
+/* Scoring role 5 wants "the mutex plus a demonstration of priority
+ * inheritance".  A hold-time number on the 1 Hz line is not that: it shows the
+ * mutex works, not that the inversion it prevents would otherwise happen.
+ *
+ * This measures the defining property directly.  With two mutexes that differ
+ * in exactly one attribute:
+ *
+ *   low  (11) takes the mutex and burns CPU while holding it
+ *   high (13) blocks on the same mutex
+ *   -> if the mutex was created with osMutexPrioInherit, the kernel raises
+ *      low to 13 for as long as high waits; the plain mutex leaves it at 11
+ *
+ * low reads its OWN priority while high is blocked, which is the boost itself,
+ * so the demonstration does not depend on any scheduler ordering assumption
+ * (an earlier version tried to show it through a third "medium" task and could
+ * not get the medium task scheduled inside the hold at all - the boost is the
+ * mechanism, the medium task is only a story about the consequence).
+ *
+ * Deliberate choices:
+ *  - all demo priorities are BELOW the lowest real task (OLED = 20), so the
+ *    demo can never delay the control loop; it runs in slack time only;
+ *  - it touches only its own two mutexes, never I2C1, so a bug here cannot
+ *    deadlock the real bus;
+ *  - one-shot per 'i' keypress; nothing runs until asked.
+ */
+#define DEMO_HOLD_US       60000U
+#define DEMO_PRIO_LOW        11U
+#define DEMO_PRIO_HIGH       13U
+#define DEMO_STK           1024U
+#define DEMO_TIMEOUT_MS    3000U
+
+static osMutexId_t     mx_demo;           /* created WITH prio inheritance   */
+static osSemaphoreId_t sem_demo_plain;    /* binary semaphore used as a lock */
+static osSemaphoreId_t sem_demo_low;      /* 'i' -> start a run              */
+static osSemaphoreId_t sem_demo_high;     /* low -> high: mutex is held      */
+static osSemaphoreId_t sem_demo_high_done;
+
+static osThreadId_t t_demo_low;
+static osThreadId_t t_demo_high;
+
+static const osMutexAttr_t mx_demo_inh_attr = {
+  .name = "mxDemoInherit", .attr_bits = osMutexPrioInherit,
+};
+static const osThreadAttr_t demo_low_attr = {
+  .name = "demoLow", .stack_size = DEMO_STK, .priority = (osPriority_t)DEMO_PRIO_LOW,
+};
+static const osThreadAttr_t demo_high_attr = {
+  .name = "demoHigh", .stack_size = DEMO_STK, .priority = (osPriority_t)DEMO_PRIO_HIGH,
+};
+
+static volatile uint32_t demo_mode;              /* which mutex is being timed */
+static volatile uint32_t demo_hold_us[2];
+static volatile uint32_t demo_wait_us[2];
+static volatile uint32_t demo_prio_seen[2];      /* holder priority while high waits */
+static volatile uint32_t demo_prio_after[2];     /* holder priority after release    */
+
+static uint32_t demo_cycles_to_us(uint32_t cyc)
+{
+  return (uint32_t)(((uint64_t)cyc * 1000000ULL) / (uint64_t)SystemCoreClock);
+}
+
+static void demo_busy_us(uint32_t us)
+{
+  uint32_t start  = DWT->CYCCNT;
+  uint32_t cycles = (uint32_t)(((uint64_t)us * (uint64_t)SystemCoreClock) / 1000000ULL);
+
+  while ((uint32_t)(DWT->CYCCNT - start) < cycles)
+  {
+  }
+}
+
+/* The two primitives under test.  FreeRTOS mutexes ALWAYS carry priority
+ * inheritance (xSemaphoreCreateMutex() has no non-inheriting variant), so the
+ * honest contrast is mutex versus binary semaphore used as a lock - which is
+ * also the reason CODING_STANDARDS 2.4 mandates a mutex for the I2C bus. */
+static osStatus_t demo_lock_acquire(uint32_t which)
+{
+  if (which == 0U)
+  {
+    return osMutexAcquire(mx_demo, osWaitForever);
+  }
+  return osSemaphoreAcquire(sem_demo_plain, osWaitForever);
+}
+
+static void demo_lock_release(uint32_t which)
+{
+  if (which == 0U)
+  {
+    (void)osMutexRelease(mx_demo);
+  }
+  else
+  {
+    (void)osSemaphoreRelease(sem_demo_plain);
+  }
+}
+
+static void demo_print_ms(const char *label, uint32_t us)
+{
+  dbg_printf("%s%lu.%02lums", label, (unsigned long)(us / 1000U),
+             (unsigned long)((us % 1000U) / 10U));
+}
+
+static void demo_low_task(void *argument)
+{
+  (void)argument;
+
+  for (;;)
+  {
+    uint32_t m;
+
+    if (osSemaphoreAcquire(sem_demo_low, osWaitForever) != osOK)
+    {
+      continue;
+    }
+
+    dbg_printf("[demo] priority inheritance: mutex vs binary semaphore\r\n");
+
+    for (m = 0U; m < 2U; m++)
+    {
+      uint32_t t0;
+      uint32_t prio_seen = 0U;
+
+      demo_mode        = m;
+      demo_wait_us[m]  = 0xFFFFFFFFU;
+      demo_hold_us[m]  = 0U;
+      demo_prio_seen[m]  = 0U;
+      demo_prio_after[m] = 0U;
+
+      if (demo_lock_acquire(m) != osOK)
+      {
+        continue;
+      }
+
+      /* Released only with the mutex already held, so high's wait is honestly
+       * "blocked by low".  high preempts here and blocks on the mutex. */
+      (void)osSemaphoreRelease(sem_demo_high);
+
+      t0 = DWT->CYCCNT;
+
+      /* Sample the holder's priority across the hold: with inheritance it must
+       * read 13, without it 11.  Sampling repeatedly is what makes this robust
+       * against the exact moment high gets queued. */
+      {
+        uint32_t chunk;
+        for (chunk = 0U; chunk < 10U; chunk++)
+        {
+          uint32_t p;
+
+          demo_busy_us(DEMO_HOLD_US / 10U);
+          p = (uint32_t)osThreadGetPriority(osThreadGetId());
+          if (p > prio_seen)
+          {
+            prio_seen = p;
+          }
+          taskYIELD();
+        }
+      }
+
+      demo_hold_us[m]   = demo_cycles_to_us(DWT->CYCCNT - t0);
+      demo_prio_seen[m] = prio_seen;
+
+      (void)demo_lock_release(m);
+
+      demo_prio_after[m] = (uint32_t)osThreadGetPriority(osThreadGetId());
+
+      (void)osSemaphoreAcquire(sem_demo_high_done, DEMO_TIMEOUT_MS);
+    }
+
+    /* ---- report ------------------------------------------------------- */
+    {
+      uint32_t i;
+
+      for (i = 0U; i < 2U; i++)
+      {
+        demo_print_ms((i == 0U) ? "[demo] mutex   : high waited "
+                                : "[demo] semaphore: high waited ", demo_wait_us[i]);
+        dbg_printf(", holder prio %lu while high waited, %lu after release\r\n",
+                   (unsigned long)demo_prio_seen[i], (unsigned long)demo_prio_after[i]);
+      }
+
+      if ((demo_prio_seen[0] == DEMO_PRIO_HIGH) && (demo_prio_seen[1] == DEMO_PRIO_LOW))
+      {
+        dbg_printf("[demo] result: inheritance confirmed (holder 11->13 only with osMutexPrioInherit)\r\n");
+      }
+      else if ((demo_prio_seen[0] == 0U) || (demo_prio_seen[1] == 0U))
+      {
+        dbg_printf("[demo] result: inconclusive (high never blocked - check priorities)\r\n");
+      }
+      else
+      {
+        dbg_printf("[demo] result: unexpected holder priorities %lu / %lu\r\n",
+                   (unsigned long)demo_prio_seen[0], (unsigned long)demo_prio_seen[1]);
+      }
+    }
+  }
+}
+
+static void demo_high_task(void *argument)
+{
+  (void)argument;
+
+  for (;;)
+  {
+    if (osSemaphoreAcquire(sem_demo_high, osWaitForever) != osOK)
+    {
+      continue;
+    }
+
+    {
+      uint32_t t0 = DWT->CYCCNT;
+
+      if (demo_lock_acquire(demo_mode) == osOK)
+      {
+        demo_wait_us[demo_mode] = demo_cycles_to_us(DWT->CYCCNT - t0);
+        (void)demo_lock_release(demo_mode);
+      }
+      (void)osSemaphoreRelease(sem_demo_high_done);
+    }
+  }
+}
+
+/* Called from the console ('i').  Only raises the start semaphore; the demo
+ * runs in its own low-priority task, so the console never blocks. */
+static void demo_prio_start(void)
+{
+  if (sem_demo_low == NULL)
+  {
+    dbg_printf("[demo] not initialised\r\n");
+    return;
+  }
+  if (osSemaphoreRelease(sem_demo_low) != osOK)
+  {
+    dbg_printf("[demo] already running, press i again after it prints\r\n");
+    return;
+  }
+  dbg_printf("[demo] starting (60 ms hold, priorities low=11 high=13)\r\n");
+}
+/* ========================================================================== */
 /* init / start                                                               */
 /* ========================================================================== */
 void app_rtos_init(void)
@@ -1121,6 +1379,27 @@ void app_rtos_init(void)
   /* The queue-ownership policy lives next to the queue: bt_rx only knows it has
    * a sink to call (bt_rx.h). */
   bt_rx_set_sink(cmd_sink);
+
+  /* ---- role 5 demo objects -------------------------------------------- */
+  /* Two mutexes that differ in exactly one attribute: that is what makes the
+   * comparison a controlled experiment rather than two unrelated numbers. */
+  mx_demo        = osMutexNew(&mx_demo_inh_attr);
+  sem_demo_plain = osSemaphoreNew(1U, 1U, NULL);   /* 1 = free, like a mutex */
+
+  sem_demo_low       = osSemaphoreNew(1U, 0U, NULL);
+  sem_demo_high      = osSemaphoreNew(1U, 0U, NULL);
+  sem_demo_high_done = osSemaphoreNew(1U, 0U, NULL);
+
+  t_demo_low  = osThreadNew(demo_low_task,  NULL, &demo_low_attr);
+  t_demo_high = osThreadNew(demo_high_task, NULL, &demo_high_attr);
+
+  if ((mx_demo == NULL) || (sem_demo_plain == NULL) ||
+      (sem_demo_low == NULL) || (sem_demo_high == NULL) ||
+      (sem_demo_high_done == NULL) ||
+      (t_demo_low == NULL) || (t_demo_high == NULL))
+  {
+    Error_Handler();
+  }
 }
 
 void app_rtos_start(void)

@@ -42,16 +42,32 @@ static int16_t round_f_to_s16(float v)
 /* timer configuration                                                       */
 /* ------------------------------------------------------------------------- */
 /* Encoder mode 3 (SMCR = 3): the counter is clocked by both TI1 and TI2 edges,
- * which is the x4 decoding that makes 11 x 30 x 4 = 1320 counts/rev.  The
- * input filters match lessonProgram (ICxF = 0011) and are worth keeping: a
- * brushed motor on the same supply is electrically noisy. */
+ * which is the x4 decoding that makes 11 x 30 x 4 = 1320 counts/rev.
+ *
+ * Input filtering (IC1F/IC2F) is NOT the lessonProgram value any more.
+ * lessonProgram used 0011 (fDTS/2, N=8 ~= 190 ns), which is far too short to
+ * reject anything a brushed motor injects.  Measured 2026-11-18, right encoder
+ * on PA8/PA9 (TIM1):
+ *
+ *   right channel driven alone, 2 s        dR = +2625  (+~45 rpm)
+ *   right channel + left channel, 2 s      dR = -11697 (-~265 rpm)
+ *   left channel alone, 2 s                dR =      0
+ *
+ * The right wheel's own PWM was identical in the first two cases, so its
+ * direction cannot have changed: those counts are edges that were never
+ * produced by the wheel.  Changing 190 ns to 1111 (fDTS/32, N=8 ~= 3 us) keeps
+ * real edges (2200 Hz per channel at 400 rpm, i.e. a 450 us period) and rejects
+ * motor noise.  Raise the filter, do not "scale" the wheel in software. */
+#define ENCODER_IC_FILTER  15UL   /* ICxF = 1111: fDTS/32, N=8 */
+
 static void qep_config(TIM_TypeDef *tim)
 {
   tim->CR1   = 0U;
   tim->PSC   = 0U;
   tim->ARR   = 0xFFFFU;
   tim->CCMR1 = (1UL << TIM_CCMR1_CC1S_Pos) | (1UL << TIM_CCMR1_CC2S_Pos) |
-               (3UL << TIM_CCMR1_IC1F_Pos) | (3UL << TIM_CCMR1_IC2F_Pos);
+               (ENCODER_IC_FILTER << TIM_CCMR1_IC1F_Pos) |
+               (ENCODER_IC_FILTER << TIM_CCMR1_IC2F_Pos);
   tim->CCER  = TIM_CCER_CC1E | TIM_CCER_CC2E;
   tim->SMCR  = 3UL;
   tim->EGR   = TIM_EGR_UG;

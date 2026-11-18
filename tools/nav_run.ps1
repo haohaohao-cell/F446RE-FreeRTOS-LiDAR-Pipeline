@@ -63,7 +63,7 @@ $script:sim = $null
 
 function Sim-Init {
     $script:sim = [pscustomobject]@{
-        G = 0L; R = 0L; QP = 0L
+        G = 0L; R = 0L; QP = 0L; Total = 0L; Pending = 0L
         Px = 0L; Py = 0L; H10 = [int64]($POSE_INIT_DEG * 10)
         Tx = 0L; Ty = 0L; NextStepMs = 0L
         Sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -71,7 +71,8 @@ function Sim-Init {
 }
 
 function Sim-Zero {
-    $script:sim.G = 0; $script:sim.R = 0; $script:sim.QP = 0
+    # 'c' zeroes pose and encoders only - the path statistics keep accumulating,
+    # which is exactly the trap the arrival test used to fall into.
     $script:sim.Px = 0; $script:sim.Py = 0; $script:sim.H10 = [int64]($POSE_INIT_DEG * 10)
 }
 
@@ -83,32 +84,40 @@ function Sim-Command([string]$Line) {
     $dist = [Math]::Sqrt([double]($x * $x + $y * $y))
     $script:sim.Tx = $x
     $script:sim.Ty = $y
-    $script:sim.G = [int64][Math]::Ceiling($dist / 100.0)
-    $script:sim.R = 0
-    $script:sim.QP = $script:sim.G
+    # G/R are cumulative since boot, exactly like path.c's counters.
+    $script:sim.Total = [int64][Math]::Ceiling($dist / 100.0)
+    $script:sim.Pending = $script:sim.Total
+    $script:sim.G += $script:sim.Total
+    $script:sim.QP = $script:sim.Pending
     $script:sim.NextStepMs = $script:sim.Sw.ElapsedMilliseconds + 250
-    [void]$script:log.Add(('[sim] G {0} {1} -> {2} waypoints' -f $x, $y, $script:sim.G))
+    [void]$script:log.Add(('[sim] G {0} {1} -> {2} waypoints (cumulative g={3})' -f $x, $y, $script:sim.Total, $script:sim.G))
 }
 
 function Sim-Tick {
-    # Advance one waypoint every 250 ms; the last one lands with a small,
-    # deliberately injected error so the error arithmetic has something to eat.
-    if ($script:sim.G -le 0) { return }
-    if ($script:sim.Sw.ElapsedMilliseconds -lt $script:sim.NextStepMs) { return }
-    if ($script:sim.R -lt $script:sim.G) {
+    # One waypoint every 250 ms; the last one lands with a small, deliberately
+    # injected error so the error arithmetic has something to eat.  Status lines
+    # keep coming after the run too, like the real 1 Hz block - the arrival test
+    # needs to see the settled state twice.
+    $now = $script:sim.Sw.ElapsedMilliseconds
+    if ($now -lt $script:sim.NextStepMs) { return }
+
+    if ($script:sim.Pending -gt 0) {
+        $script:sim.Pending--
         $script:sim.R++
-        $frac = [double]$script:sim.R / [double]$script:sim.G
-        $script:sim.Px = [int64][Math]::Round($script:sim.Tx * $frac)
-        $script:sim.Py = [int64][Math]::Round($script:sim.Ty * $frac)
-        if ($script:sim.R -eq $script:sim.G) {
+        $doneFrac = 1.0 - ([double]$script:sim.Pending / [double]$script:sim.Total)
+        $script:sim.Px = [int64][Math]::Round($script:sim.Tx * $doneFrac)
+        $script:sim.Py = [int64][Math]::Round($script:sim.Ty * $doneFrac)
+        if ($script:sim.Pending -eq 0) {
             $script:sim.Px += 6
             $script:sim.Py -= 4
             $script:sim.H10 += 12
         }
-        $script:sim.QP = $script:sim.G - $script:sim.R
-        $script:sim.NextStepMs = $script:sim.Sw.ElapsedMilliseconds + 250
-        Emit-Status
+        $script:sim.QP = $script:sim.Pending
+        $script:sim.NextStepMs = $now + 250
+    } else {
+        $script:sim.NextStepMs = $now + 500
     }
+    Emit-Status
 }
 
 function Emit-Status {
@@ -244,6 +253,17 @@ function Invoke-Run($Target) {
 
     Send-Key 'c'                      # zero pose AND both encoder totals
     Pump -Ms 350
+    # Baseline for the cumulative g counter, taken BEFORE the command is sent:
+    # after the command g has already moved, so a baseline read afterwards can
+    # never decrease and the "was it accepted?" test would never fire.
+    $gBase = $null
+    $script:lines.Clear()
+    Pump -Ms 1200
+    foreach ($l in $script:lines) {
+        $s = Parse-Status $l
+        if ($s) { $gBase = $s.G; break }
+    }
+    $script:lines.Clear()
     Send-Bt ('G {0} {1}' -f $x, $y)
 
     $t0 = Get-Date
@@ -251,6 +271,15 @@ function Invoke-Run($Target) {
     $last = $null
     $sawCommand = $false
     $done = $false
+    $confirm = 0
+    # WHAT "ARRIVED" MEANS.  Not r >= g: measured 2026-11-18, PATH: g/r are
+    # CUMULATIVE since boot (path.c stats_add() only ever adds, nothing resets
+    # them per path), so after a couple of runs g is far ahead of r forever and
+    # a r >= g test never fires - the first version of this script reported a
+    # 1.4 m run as complete 1.2 s in, then reported a perfect run as a timeout.
+    # What is trustworthy is "Q_Path empty" plus "the pose is at the target":
+    # the waypoint arrival radius is 30 mm (path.h PATH_ARRIVE_MM).
+    $arriveTol = [Math]::Max(120.0, 0.10 * $dist)
 
     while ((Get-Date) -lt $deadline) {
         Pump -Ms 150
@@ -258,17 +287,20 @@ function Invoke-Run($Target) {
             $s = Parse-Status $l
             if ($s) {
                 $last = $s
-                if ($s.G -gt 0) { $sawCommand = $true }
-                if (($s.G -gt 0) -and ($s.R -ge $s.G) -and ($s.QP -eq 0)) {
-                    $done = $true
-                    break
+                if (($s.QP -gt 0) -or (($null -ne $gBase) -and ($s.G -gt $gBase))) { $sawCommand = $true }
+                $dTgt = [Math]::Sqrt([double](($s.Ex - $x) * ($s.Ex - $x) + ($s.Ey - $y) * ($s.Ey - $y)))
+                if (($s.QP -eq 0) -and ($dTgt -le $arriveTol) -and $sawCommand) {
+                    $confirm++
+                    if ($confirm -ge 2) { $done = $true; break }
+                } else {
+                    $confirm = 0
                 }
             }
         }
         $script:lines.Clear()
         if ($done) { break }
         if (-not $sawCommand -and ((Get-Date) - $t0).TotalSeconds -gt 6) {
-            throw 'the car never acknowledged the command (PATH: g stayed 0) - check the BT link'
+            throw 'the car never acknowledged the command (no new waypoints) - check the BT link'
         }
     }
 
@@ -390,6 +422,8 @@ if ($Simulate) {
         $script:dbg.DtrEnable = $false
         $script:dbg.RtsEnable = $false
         $script:dbg.Open()
+        Start-Sleep -Milliseconds 300     # let the VCP finish initialising
+        $script:dbg.DiscardInBuffer()
     } catch {
         Write-Host ('  cannot open {0}: {1}' -f $DebugPort, $_.Exception.Message) -ForegroundColor Red
         exit 2

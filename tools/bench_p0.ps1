@@ -216,13 +216,19 @@ function Get-Enc {
 function Assert-Alive {
     # The one thing worth failing fast on: a target that prints nothing is a
     # power problem, not a software problem (measured 2026-11-18: 0.11 V).
-    $script:lines.Clear()
-    Send-Key 'h'
-    Pump -Ms 700
-    $reply = $script:lines | Where-Object { $_ -match '^\[cmd\]' } | Select-Object -First 1
+    # Retried: the first byte written right after SerialPort.Open() is sometimes
+    # swallowed while the VCP finishes initialising (measured 2026-11-18 - the
+    # single-shot version reported a perfectly healthy board as dead).
+    $reply = $null
+    for ($try = 1; $try -le 3 -and -not $reply; $try++) {
+        $script:lines.Clear()
+        Send-Key 'h'
+        Pump -Ms 700
+        $reply = $script:lines | Where-Object { $_ -match '^\[cmd\]' } | Select-Object -First 1
+    }
     if (-not $reply) {
         Write-Host ''
-        Write-Host '  NO ANSWER on the debug console.' -ForegroundColor Red
+        Write-Host '  NO ANSWER on the debug console (3 tries).' -ForegroundColor Red
         Write-Host '  The MCU is not running.  Check, in this order:' -ForegroundColor Yellow
         Write-Host '    1. main power switch ON, pack connected and charged'
         Write-Host '    2. tools\flash_and_monitor.cmd -Probe   (expect a voltage, not 0.1 V)'
@@ -453,6 +459,8 @@ if (-not $Simulate) {
         $script:sp.DtrEnable = $false      # DTR/RTS can pulse NRST on this adapter
         $script:sp.RtsEnable = $false
         $script:sp.Open()
+        Start-Sleep -Milliseconds 300     # let the VCP finish initialising
+        $script:sp.DiscardInBuffer()
     } catch {
         Write-Host ('  cannot open {0}: {1}' -f $Port, $_.Exception.Message) -ForegroundColor Red
         exit 2
