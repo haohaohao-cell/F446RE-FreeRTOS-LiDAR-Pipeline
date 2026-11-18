@@ -101,6 +101,11 @@ int main(void)
   expect_ok("S \r\n", CMD_TYPE_STOP, 0, 0);
   expect_ok("P\n", CMD_TYPE_QUERY, 0, 0);
   expect_ok("?\n", CMD_TYPE_QUERY, 0, 0);
+  /* 'Z' is the untethered counterpart of the console 'c' key: clear the path
+   * and zero the pose without a power cycle (which would drop the BT link). */
+  expect_ok("Z", CMD_TYPE_ZERO, 0, 0);
+  expect_ok("z\n", CMD_TYPE_ZERO, 0, 0);
+  expect_ok("Z \r\n", CMD_TYPE_ZERO, 0, 0);
 
   /* ---- rejected: syntax ------------------------------------------------ */
   expect_err("", BT_ERR_SYNTAX);
@@ -117,6 +122,7 @@ int main(void)
   expect_err("G - 0", BT_ERR_SYNTAX);              /* bare sign */
   expect_err("X 1 2", BT_ERR_SYNTAX);              /* unknown command */
   expect_err("S x", BT_ERR_SYNTAX);
+  expect_err("Z x", BT_ERR_SYNTAX);                /* 'Z' takes no argument */
   expect_err("?x", BT_ERR_SYNTAX);
   expect_err("P 1", BT_ERR_SYNTAX);
   expect_err("G 0x10 2", BT_ERR_SYNTAX);           /* hex not accepted */

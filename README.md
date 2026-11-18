@@ -165,7 +165,7 @@ Frame convention: **+y is forward, +x is the car's right**, millimetres, +/-5000
 | `i` | **role 5: priority-inheritance demo** |
 | `h` / `?` | help |
 
-**COM10 @115 200** (Bluetooth, one command per line): `G <x_mm> <y_mm>` / `S` / `P` / `?`
+**COM10 @115 200** (Bluetooth, one command per line): `G <x_mm> <y_mm>` / `Z` (zero pose+path) / `S` / `P` / `?`
 
 > The jog duty is **40 %**, not 20 %: on this pack, 20-30 % is a dead zone (neither
 > wheel moves).

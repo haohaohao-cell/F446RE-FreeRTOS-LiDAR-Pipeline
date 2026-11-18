@@ -50,8 +50,17 @@ typedef enum
 {
   CMD_TYPE_GO    = 0,   /* move to (x_mm, y_mm)                       */
   CMD_TYPE_STOP  = 1,   /* stop and clear the remaining path          */
-  CMD_TYPE_QUERY = 2    /* report pose; carries no target             */
+  CMD_TYPE_QUERY = 2,   /* report pose; carries no target             */
+  CMD_TYPE_ZERO  = 3    /* clear path AND zero the pose ("Z")         */
 } cmd_type_t;
+
+/* Why CMD_TYPE_ZERO exists: the pose is relative to boot and the console key
+ * that zeroes it ('c') is only on USART2, i.e. only reachable over the ST-Link
+ * USB cable.  An untethered run - which is what the marking asks for - then has
+ * no way to re-zero between runs except a power cycle, and that drops the
+ * Bluetooth link and costs a re-pair in front of the examiner.  'Z' over the
+ * Bluetooth link derives the same effect: clear Q_Path, raise the STOP event,
+ * and request the pose reset that the Pose task already owns. */
 
 typedef struct
 {

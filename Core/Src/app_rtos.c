@@ -1,4 +1,4 @@
-﻿/* -----------------------------------------------------------------------------
+/* -----------------------------------------------------------------------------
  * app_rtos.c - the 8-thread architecture (see app_rtos.h for the table).
  *
  * DATA FLOW
@@ -683,6 +683,19 @@ static void path_task(void *argument)
       (void)osEventFlagsSet(evt_nav, APP_NAV_EVT_STOP);
       path_note_aborted();
       dbg_printf("[nav] STOP: Q_Path cleared, PWM to 0\r\n");
+    }
+    else if (cmd.type == (uint8_t)CMD_TYPE_ZERO)
+    {
+      /* Bluetooth counterpart of the console 'c' key, so an untethered run can
+       * be re-zeroed between attempts without a power cycle (which would cost
+       * a Bluetooth re-pair in front of the examiner).  Same order as 'c':
+       * stop first, then ask the Pose task - the only owner of the encoder
+       * totals - to zero, so a torn 32-bit total cannot happen. */
+      (void)osMessageQueueReset(q_path);
+      (void)osEventFlagsSet(evt_nav, APP_NAV_EVT_STOP);
+      path_note_aborted();
+      g_pose_reset_req = 1U;
+      dbg_printf("[nav] ZERO: Q_Path cleared, pose + encoders will zero\r\n");
     }
     else
     {

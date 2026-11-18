@@ -214,6 +214,18 @@ int bt_parse_line(const char *line, cmd_msg_t *out)
       out->reserved2 = 0U;
       return BT_OK;
 
+    case 'Z':
+      if (bt_at_end(p) == 0)
+      {
+        return BT_ERR_SYNTAX;
+      }
+      out->type = (uint8_t)CMD_TYPE_ZERO;
+      out->reserved = 0U;
+      out->x_mm = 0;
+      out->y_mm = 0;
+      out->reserved2 = 0U;
+      return BT_OK;
+
     case 'P':
     case '?':
       if (bt_at_end(p) == 0)
