@@ -57,7 +57,7 @@
 /* Largest number of pixel bytes per I2C transaction.  32 data + 1 control byte
  * is ~2.97 ms at 100 kHz, just under the 3 ms mutex hold target.  See the
  * timing note at the top of the file before changing this. */
-#define OLED_CHUNK_BYTES  32U
+#define OLED_CHUNK_BYTES  16U
 
 /* Bounded: an absent panel must cost milliseconds at init, never a hang. */
 #define OLED_TMO_MS       10U

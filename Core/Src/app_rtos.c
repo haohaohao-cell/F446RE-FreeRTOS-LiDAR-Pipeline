@@ -818,13 +818,35 @@ static void console_poll(void)
   else if ((ch == (uint8_t)'h') || (ch == (uint8_t)'H') || (ch == (uint8_t)'?'))
   {
     dbg_printf("[cmd] s=stop lidar g=restart lidar f/b=both fwd/rev "
-               "l/r=left/right only x=stop c=zero enc e=read enc i=prio demo h=help\r\n");
+               "l/r=left/right only x=stop c=zero enc e=read enc i=prio demo d=i2c scan h=help\r\n");
   }
   else if ((ch == (uint8_t)'i') || (ch == (uint8_t)'I'))
   {
     /* Role 5 evidence.  Raise-and-return: the demo runs in its own low-priority
      * tasks, so the console (and everyone else) keeps running. */
     demo_prio_start();
+  }
+  else if ((ch == (uint8_t)'d') || (ch == (uint8_t)'D'))
+  {
+    /* I2C address scan: answers "is the panel at 0x3D instead of 0x3C, or is
+     * there nothing on the bus at all" without a logic analyser.  A one-byte
+     * write is enough: a device that acknowledges is present, a NACK means the
+     * address is empty.  Called from a task, so it takes the bus mutex once per
+     * address exactly like any other transfer. */
+    uint8_t  addr;
+    uint8_t  probe = 0U;
+    uint32_t found = 0U;
+
+    dbg_printf("[i2c] scanning 0x08..0x77\r\n");
+    for (addr = 0x08U; addr <= 0x77U; addr++)
+    {
+      if (i2c_bus_write(addr, &probe, 1U, 5U) == I2C_BUS_OK)
+      {
+        dbg_printf("[i2c]   found 0x%02X\r\n", (unsigned)addr);
+        found++;
+      }
+    }
+    dbg_printf("[i2c] %lu device(s)\r\n", (unsigned long)found);
   }
   else
   {

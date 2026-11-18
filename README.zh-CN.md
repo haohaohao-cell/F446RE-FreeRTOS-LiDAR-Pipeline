@@ -17,7 +17,7 @@
 
 | 评分角色 | 本工程对应 | 证据 |
 |---|---|---|
-| 1 完整应用 | 8 线程 + 蓝牙 + 3 队列 | 1 Hz 状态行（除 OLED 外全部并发） |
+| 1 完整应用 | 8 线程 + 蓝牙 + 3 队列 + OLED | 1 Hz 状态行 + 屏幕显示 |
 | 2 任务调度 | `osDelayUntil` + 实测计时 | 周期/抖动/WCET/超时计数 |
 | 3 消息队列 | `Q_Lidar` / `Q_Cmd` / `Q_Path` | 峰值占用 + 溢出计数 |
 | 4 信号量 | TIM6 → IMU 任务 | 实测 100 Hz |
@@ -97,7 +97,7 @@
 | 蓝牙 | HC-04，UART5（PC12/PD2），Windows SPP = **COM10** |
 | 调试串口 | USART2（PA2/PA3）→ ST-Link 虚拟串口 **COM8** @115 200 |
 | 雷达 | RPLidar C1，USART3 @460 800 + DMA1_Stream1（PC10/PC11） |
-| OLED | SSD1306 走 I2C1（0x3C）—— **驱动已写，面板未接**（`oled=-3`） |
+| OLED | SSD1306 128x64，I2C1（0x3C），分页刷新 + 16 B 分块，**实测最长持锁 2.4 ms** |
 
 引脚/定时器/NVIC 的**唯一真源**是 [`Core/Inc/board_pins.h`](Core/Inc/board_pins.h)，不要在别处写死数字。
 
@@ -157,6 +157,7 @@ tools\bt_send.cmd "G 0 1400"
 | `c` | 位姿 + 两路编码器清零（由 Pose 任务执行，保证不撕裂） |
 | `e` | 读 `L= R= cnt \| rpm \| x y \| h gyro` |
 | `i` | **角色 5：优先级继承对比演示** |
+| `d` | **I2C 总线扫描**（0x08–0x77），接外设时确认地址 |
 | `h` / `?` | 帮助 |
 
 **COM10 @115 200**（蓝牙，一行一条）：`G <x_mm> <y_mm>` / `Z`（清零位姿+清路径）/ `S` / `P` / `?`
@@ -227,7 +228,7 @@ Core/Src/pose.c         里程计 + 陀螺航向（陀螺优先，轮式兜底�
 Core/Src/path.c         100 mm 路点生成 + 航向控制律
 Core/Src/imu.c          MPU-6500，任务上下文采样
 Core/Src/i2c_bus.c      I2C1 唯一所有者：prio-inherit 互斥量 + 有界事务
-Core/Src/oled.c         SSD1306 + 6x8 字库（未上过真面板）
+Core/Src/oled.c         SSD1306 128x64 + 6x8 字库，分页刷新
 Core/Inc/board_pins.h   引脚/定时器/NVIC 唯一真源
 tools/                  bench_p0 / nav_run / bt_send / flash_and_monitor / serial_console
 tools/host_tests/       主机侧单元测试（解析语法、路点生成、跟踪律）
