@@ -181,12 +181,24 @@ static void apply_wheel(TIM_TypeDef *tim, uint8_t fwd_ch, uint8_t rev_ch,
 
 static void apply_outputs(int16_t left, int16_t right)
 {
+#if BOARD_DRIVE_FRAME_REVERSED
+  /* The body is turned 180 degrees (caster moved to the rear), so the channel
+   * wired as "left" is physically the car's right wheel.  Swap, do not negate:
+   * positive duty still drives that wheel forwards.  The invert for the TIM4
+   * channel moves with it, which is why the right value goes out unmodified on
+   * the TIM2 channel and the left value arrives negated on TIM4. */
+  apply_wheel(BOARD_MOTOR_TIMER, BOARD_MOTOR_L_FORWARD_CH, BOARD_MOTOR_L_REVERSE_CH,
+              right, s_motor.right_pwm_limit);
+  apply_wheel(BOARD_MOTOR2_TIMER, BOARD_MOTOR2_FORWARD_CH, BOARD_MOTOR2_REVERSE_CH,
+              (int16_t)(-left), s_motor.left_pwm_limit);
+#else
   int16_t right_signed = (BOARD_MOTOR_RIGHT_INVERT != 0) ? (int16_t)(-right) : right;
 
   apply_wheel(BOARD_MOTOR_TIMER, BOARD_MOTOR_L_FORWARD_CH, BOARD_MOTOR_L_REVERSE_CH,
               left, s_motor.left_pwm_limit);
   apply_wheel(BOARD_MOTOR2_TIMER, BOARD_MOTOR2_FORWARD_CH, BOARD_MOTOR2_REVERSE_CH,
               right_signed, s_motor.right_pwm_limit);
+#endif
 
   s_motor.output_l = left;
   s_motor.output_r = right;

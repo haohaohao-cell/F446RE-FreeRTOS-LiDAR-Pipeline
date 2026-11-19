@@ -1379,6 +1379,14 @@ void app_rtos_init(void)
   memset(timing_int, 0, sizeof(timing_int));
   memset(timing_pub, 0, sizeof(timing_pub));
 
+  /* Which drive frame is compiled in.  After a chassis rework (caster moved to
+   * the rear, body turned 180 degrees) LEFT and RIGHT are swapped, and a wrong
+   * build makes every turn go the wrong way - so print it once at boot rather
+   * than discovering it on the floor.  See board_pins.h 3b. */
+  dbg_printf("[drive] frame: %s\r\n",
+             (BOARD_DRIVE_FRAME_REVERSED != 0) ? "REVERSED (caster at rear)"
+                                               : "normal (caster at front)");
+
   if (osKernelInitialize() != osOK)
   {
     Error_Handler();

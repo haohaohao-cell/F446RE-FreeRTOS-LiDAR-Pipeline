@@ -166,10 +166,30 @@ static int16_t read_delta(encoder_ch_t *ch, uint32_t period_ms)
   return signed_delta;
 }
 
+/* Which physical channel is the car's LEFT wheel?
+ *
+ * Normally s_left.  After the body rework (BOARD_DRIVE_FRAME_REVERSED) the
+ * chassis is turned 180 degrees, so the channel wired as "left" ends up on the
+ * car's right.  Every logical accessor goes through this pair, so the swap is
+ * declared once: the PID feedback (motor_update), the odometry deltas and the
+ * 1 Hz L=/R= readout all stay consistent with the motor outputs, which are
+ * swapped the same way in motor.c's apply_outputs(). */
+static encoder_ch_t *ch_logical_left(void)
+{
+  return (BOARD_DRIVE_FRAME_REVERSED != 0) ? &s_right : &s_left;
+}
+
+static encoder_ch_t *ch_logical_right(void)
+{
+  return (BOARD_DRIVE_FRAME_REVERSED != 0) ? &s_left : &s_right;
+}
+
 int encoder_sample(uint32_t period_ms, int16_t *delta_left, int16_t *delta_right)
 {
-  int16_t dl = read_delta(&s_left, period_ms);
-  int16_t dr = read_delta(&s_right, period_ms);
+  /* Both channels are read on every sample, exactly once each: read_delta()
+   * consumes the hardware counter, so skipping one would silently lose counts. */
+  int16_t dl = read_delta(ch_logical_left(), period_ms);
+  int16_t dr = read_delta(ch_logical_right(), period_ms);
 
   if (delta_left != NULL)
   {
@@ -184,20 +204,20 @@ int encoder_sample(uint32_t period_ms, int16_t *delta_left, int16_t *delta_right
 
 int16_t encoder_left_rpm(void)
 {
-  return s_left.rpm;
+  return ch_logical_left()->rpm;
 }
 
 int16_t encoder_right_rpm(void)
 {
-  return s_right.rpm;
+  return ch_logical_right()->rpm;
 }
 
 int32_t encoder_left_total(void)
 {
-  return s_left.total;
+  return ch_logical_left()->total;
 }
 
 int32_t encoder_right_total(void)
 {
-  return s_right.total;
+  return ch_logical_right()->total;
 }
