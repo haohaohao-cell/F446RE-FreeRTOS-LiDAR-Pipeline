@@ -137,7 +137,8 @@ tools\serial_console.cmd                 :: 实时终端（s/g/f/b/l/r/x/c/e/i/h
 tools\nav_run.cmd -Only 0,1400
 
 :: 无线（验收用：只走蓝牙，终点用卷尺量）
-tools\bt_send.cmd "G 0 1400"
+tools\bt_run.cmd "0 1400"        :: 清零位姿 + 发目标，一条命令
+tools\bt_send.cmd "S"           :: 只发单条（急停）
 ```
 
 车头方向约定：**+y 是车头向前，+x 是车的右侧**，坐标单位 mm，范围 ±5000。
