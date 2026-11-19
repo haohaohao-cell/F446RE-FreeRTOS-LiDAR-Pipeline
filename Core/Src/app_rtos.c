@@ -1384,8 +1384,8 @@ void app_rtos_init(void)
    * build makes every turn go the wrong way - so print it once at boot rather
    * than discovering it on the floor.  See board_pins.h 3b. */
   dbg_printf("[drive] frame: %s\r\n",
-             (BOARD_DRIVE_FRAME_REVERSED != 0) ? "REVERSED (caster at rear)"
-                                               : "normal (caster at front)");
+             (BOARD_DRIVE_FRAME_REVERSED != 0) ? "REVERSED (drives wheels-first)"
+                                               : "normal (drives caster-first)");
 
   if (osKernelInitialize() != osOK)
   {

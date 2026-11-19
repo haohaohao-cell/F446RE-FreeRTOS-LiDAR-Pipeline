@@ -182,15 +182,29 @@ static void apply_wheel(TIM_TypeDef *tim, uint8_t fwd_ch, uint8_t rev_ch,
 static void apply_outputs(int16_t left, int16_t right)
 {
 #if BOARD_DRIVE_FRAME_REVERSED
-  /* The body is turned 180 degrees (caster moved to the rear), so the channel
-   * wired as "left" is physically the car's right wheel.  Swap, do not negate:
-   * positive duty still drives that wheel forwards.  The invert for the TIM4
-   * channel moves with it, which is why the right value goes out unmodified on
-   * the TIM2 channel and the left value arrives negated on TIM4. */
+  /* DRIVE FRAME REVERSED: the car travels towards the driven-wheel end (the
+   * caster trails), so a positive "forward" command has to turn both wheels the
+   * OTHER way - and the wheel wired as "left" is on the travel-right.
+   *
+   * Derivation, because getting the sign wrong here is symmetric and silent:
+   *   u = wheel surface velocity along chassis +y (towards the caster, which is
+   *       where a positive command used to send the car)
+   *   travel forward is -y, so the travel speed is v = -u, and
+   *   omega = (v_R - v_L)/track = (u_B - u_A)/track
+   *   The controller asks for v_L = v - w*track/2 and v_R = v + w*track/2, and
+   *   with the body reversed B is the travel-LEFT wheel and A the travel-RIGHT:
+   *       u_B = -v_L = -v + w*track/2
+   *       u_A = -v_R = -v - w*track/2
+   *   TIM4 is wired inverted, so apply_wheel(arg) produces u_B = -arg. Hence
+   *       TIM2 <- -right      TIM4 <- +left
+   *
+   * Straight-line check: left = right = +V gives u_A = u_B = -V, i.e. the car
+   * moves towards the driven-wheel end.  Left-turn check: w > 0 gives
+   * u_B - u_A = w*track > 0, which is counter-clockwise.  Both correct. */
   apply_wheel(BOARD_MOTOR_TIMER, BOARD_MOTOR_L_FORWARD_CH, BOARD_MOTOR_L_REVERSE_CH,
-              right, s_motor.right_pwm_limit);
+              (int16_t)(-right), s_motor.left_pwm_limit);
   apply_wheel(BOARD_MOTOR2_TIMER, BOARD_MOTOR2_FORWARD_CH, BOARD_MOTOR2_REVERSE_CH,
-              (int16_t)(-left), s_motor.left_pwm_limit);
+              left, s_motor.right_pwm_limit);
 #else
   int16_t right_signed = (BOARD_MOTOR_RIGHT_INVERT != 0) ? (int16_t)(-right) : right;
 

@@ -166,30 +166,30 @@ static int16_t read_delta(encoder_ch_t *ch, uint32_t period_ms)
   return signed_delta;
 }
 
-/* Which physical channel is the car's LEFT wheel?
+/* Which physical channel is the car's LEFT wheel, and does its count need to be
+ * flipped?
  *
- * Normally s_left.  After the body rework (BOARD_DRIVE_FRAME_REVERSED) the
- * chassis is turned 180 degrees, so the channel wired as "left" ends up on the
- * car's right.  Every logical accessor goes through this pair, so the swap is
- * declared once: the PID feedback (motor_update), the odometry deltas and the
- * 1 Hz L=/R= readout all stay consistent with the motor outputs, which are
- * swapped the same way in motor.c's apply_outputs(). */
-static encoder_ch_t *ch_logical_left(void)
-{
-  return (BOARD_DRIVE_FRAME_REVERSED != 0) ? &s_right : &s_left;
-}
-
-static encoder_ch_t *ch_logical_right(void)
-{
-  return (BOARD_DRIVE_FRAME_REVERSED != 0) ? &s_left : &s_right;
-}
-
+ * Normally: logical left = s_left, counts as-is.
+ *
+ * BOARD_DRIVE_FRAME_REVERSED: the car travels towards the driven-wheel end, so
+ * (a) the channel wired as "left" is on the travel-right, and (b) both wheels
+ * turn the opposite way for the same travel direction.  Hence SWAP AND NEGATE,
+ * exactly matching the swap-and-negate in motor.c's apply_outputs().
+ *
+ * This is a compile-time branch on purpose: at -O0 a pair of helper calls would
+ * add ~100 bytes to a build that never uses them, and the default build must
+ * stay bit-for-bit the demo-proven one. */
 int encoder_sample(uint32_t period_ms, int16_t *delta_left, int16_t *delta_right)
 {
   /* Both channels are read on every sample, exactly once each: read_delta()
    * consumes the hardware counter, so skipping one would silently lose counts. */
-  int16_t dl = read_delta(ch_logical_left(), period_ms);
-  int16_t dr = read_delta(ch_logical_right(), period_ms);
+#if BOARD_DRIVE_FRAME_REVERSED
+  int16_t dl = (int16_t)(-read_delta(&s_right, period_ms));
+  int16_t dr = (int16_t)(-read_delta(&s_left, period_ms));
+#else
+  int16_t dl = read_delta(&s_left, period_ms);
+  int16_t dr = read_delta(&s_right, period_ms);
+#endif
 
   if (delta_left != NULL)
   {
@@ -202,22 +202,44 @@ int encoder_sample(uint32_t period_ms, int16_t *delta_left, int16_t *delta_right
   return (period_ms == 0U) ? -1 : 0;
 }
 
+#if BOARD_DRIVE_FRAME_REVERSED
 int16_t encoder_left_rpm(void)
 {
-  return ch_logical_left()->rpm;
+  return (int16_t)(-s_right.rpm);
 }
 
 int16_t encoder_right_rpm(void)
 {
-  return ch_logical_right()->rpm;
+  return (int16_t)(-s_left.rpm);
 }
 
 int32_t encoder_left_total(void)
 {
-  return ch_logical_left()->total;
+  return -(int32_t)s_right.total;
 }
 
 int32_t encoder_right_total(void)
 {
-  return ch_logical_right()->total;
+  return -(int32_t)s_left.total;
 }
+#else
+int16_t encoder_left_rpm(void)
+{
+  return s_left.rpm;
+}
+
+int16_t encoder_right_rpm(void)
+{
+  return s_right.rpm;
+}
+
+int32_t encoder_left_total(void)
+{
+  return s_left.total;
+}
+
+int32_t encoder_right_total(void)
+{
+  return s_right.total;
+}
+#endif

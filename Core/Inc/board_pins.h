@@ -147,30 +147,34 @@ _Static_assert(BOARD_MOTOR_PWM_PERIOD <= 65535U, "TIM4 ARR does not fit");
 /* ---------------------------------------------------------------------------
  * 3b. DRIVE FRAME: which end of the chassis is "forward"
  * ---------------------------------------------------------------------------
- * 2026-11-19: the caster was moved to the rear and the car is placed on the
- * start line so that it drives with the driven wheels leading.  That turns the
- * body 180 degrees relative to the wiring, and one thing follows from it:
+ * 2026-11-19: the car is run the other way round - it travels towards the end
+ * that carries the DRIVEN wheels, so the caster trails behind ("rear drive
+ * becomes front drive").  Nothing has to be unscrewed for that; what changes is
+ * which way a positive wheel command has to turn.
  *
- *   the wheel wired as "left"  (TIM2/PA0/PA1) is now on the car's RIGHT,
- *   the wheel wired as "right" (TIM4/PB6/PB7) is now on the car's LEFT.
+ * Two things flip together, and they must stay in step:
  *
- * So LEFT and RIGHT are SWAPPED - not negated.  Positive still means "forward"
- * for both wheels (and both encoders still count up going forward), which is why
- * the fix is one swap at the motor outputs and the matching swap at the encoder
- * inputs.  Nothing else moves.
+ *   1. DIRECTION.  A positive command used to send the car towards the caster
+ *      end; it must now send it towards the driven-wheel end.  So both wheel
+ *      outputs are NEGATED (motor.c apply_outputs).
+ *   2. LEFT/RIGHT.  Seen from the new travel direction, the channel wired as
+ *      "left" (TIM2/PA0/PA1) is on the car's right.  So the two channels are
+ *      SWAPPED - on the motor outputs AND on the encoder inputs, because the
+ *      PID feedback must describe the same wheels the controller commands.
+ *
+ * Negating without swapping (or the reverse) gives the classically confusing
+ * "it drives forwards but every turn is mirrored" - which is why both live
+ * behind this single switch, with the derivation written out in motor.c.
  *
  * WHAT DOES NOT CHANGE: POSE_IMU_TO_NAV_DEG (pose.c).  Heading is measured from
- * the gyro's zero at power-up, and the operator places the car with its driving
- * direction along +y; rotating the body about the VERTICAL axis leaves the
+ * the gyro's zero at power-up, and the operator places the car with its travel
+ * direction along +y; rotating the chassis about the VERTICAL axis leaves the
  * gyro's yaw measurement unchanged.
  *
- * Getting this wrong is not subtle-failure, it is "every turn goes the wrong
- * way": the heading controller then drives away from the waypoint instead of
- * towards it.  The boot banner prints which frame is compiled in, so check the
- * first line after a flash.
- *
- *   0 = original layout (caster at the front).  Measured, demo-proven.
- *   1 = body reworked (caster at the rear, driven wheels leading).          */
+ *   0 = original layout (travel towards the caster).  Measured, demo-proven.
+ *   1 = reversed layout  (travel towards the driven wheels, caster trails).
+ *       COMPILES, and the signs are derived in motor.c, but it has NEVER been
+ *       driven on the floor - validate wheels-up before trusting it.          */
 #define BOARD_DRIVE_FRAME_REVERSED 0
 
 /* lessonProgram MOTOR_DEFAULT_* values are kept as the TARGET clamp (they limit
