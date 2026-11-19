@@ -48,6 +48,13 @@ try {
 
 try {
     $sp.Write($line + "`n")
+    # Idempotent single-letter commands (S, Z, P) go twice: the first write after
+    # opening an SPP port is occasionally swallowed, and a lost S means the car
+    # keeps driving.
+    if ($line.Length -eq 1) {
+        Start-Sleep -Milliseconds 150
+        $sp.Write($line + "`n")
+    }
     # Give the SPP buffer time to actually drain before the handle closes:
     # closing immediately after Write() is exactly the failure that made a late
     # STOP arrive and wipe a freshly generated path.

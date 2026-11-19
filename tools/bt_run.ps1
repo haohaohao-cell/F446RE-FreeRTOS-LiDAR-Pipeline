@@ -56,8 +56,16 @@ try {
 }
 
 try {
+    # The first write after opening an SPP port is sometimes swallowed (the same
+    # thing happens on the ST-Link VCP, which is why bench_p0 retries its 'h').
+    # Losing the Z is the worst possible loss: G then runs against last time's
+    # pose, the heading no longer matches the car, and the controller rotates on
+    # the spot before doing anything else.  Zeroing twice is harmless, so send it
+    # twice rather than hope.
     $sp.Write("Z`n")
-    Write-Host 'sent: Z  (pose + path zeroed)' -ForegroundColor Green
+    Start-Sleep -Milliseconds 250
+    $sp.Write("Z`n")
+    Write-Host 'sent: Z (twice - pose + path zeroed)' -ForegroundColor Green
     Start-Sleep -Milliseconds $SettleMs
 
     $sp.Write(('G {0} {1}' -f $x, $y) + "`n")
