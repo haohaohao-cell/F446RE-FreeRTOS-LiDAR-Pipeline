@@ -18,7 +18,7 @@
 ## 顺序
 
 ```
-0. 车上电，双击 preflight_link.cmd    → 要看到 link: OK，约 5000 B/s
+0. 车上电，双击 preflight_link.cmd    → 要看到 link: OK，约 7000 B/s
 1. 拔 USB，等 3 秒
 2. 双击 demo_1_straight.cmd           → 等约 13 秒，车自己停 → 卷尺量
 3. 把车抱回起点（别推着走）

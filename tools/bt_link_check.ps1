@@ -8,7 +8,7 @@
 # notices that on stage the car has already been commanded and has not moved.
 # This script answers the question objectively in three seconds: the firmware
 # streams a ~256 byte telemetry frame 20 times a second over UART5, so a healthy
-# link delivers roughly 5000 bytes per second.  0 bytes means the link is dead
+# link delivers roughly 7000 bytes per second.  0 bytes means the link is dead
 # no matter what the port open() returned, and a few hundred means it is fading.
 #
 # Usage:

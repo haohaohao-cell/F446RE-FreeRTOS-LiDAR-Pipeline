@@ -169,7 +169,7 @@ function Write-BtLinkReport
     }
     elseif ($m.Bytes -gt 0)
     {
-        Write-Host ("link: WEAK, only {0} B/s ({1} B in {2} ms) - expected ~5000 B/s" -f $m.Rate, $m.Bytes, $m.Ms) -ForegroundColor Yellow
+        Write-Host ("link: WEAK, only {0} B/s ({1} B in {2} ms) - expected ~7000 B/s" -f $m.Rate, $m.Bytes, $m.Ms) -ForegroundColor Yellow
         Write-Host '  the radio link is up but dropping data. If the car misbehaves, re-run.' -ForegroundColor Yellow
         return $true
     }

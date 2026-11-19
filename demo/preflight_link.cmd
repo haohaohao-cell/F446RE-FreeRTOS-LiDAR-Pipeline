@@ -5,5 +5,5 @@ setlocal
 set PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe
 "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\tools\bt_link_check.ps1" -Sec 3
 echo.
-echo   Healthy = about 5000 B/s.  Zero bytes = the car will not hear anything.
+echo   Healthy = about 7000 B/s.  Zero bytes = the car will not hear anything.
 pause
