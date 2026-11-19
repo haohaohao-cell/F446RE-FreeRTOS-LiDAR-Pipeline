@@ -31,7 +31,7 @@ OLED 已接上并正常显示；无线演示流程（蓝牙下发命令 + 卷尺
 **但三个验收目标还没量过 —— 明天第一件事就是复跑三趟并逐分量量尺。**
 
 硬约束（不得违反）：
-- 编译必须 0 warning / 0 error：make -C Debug -j8 all（基线 text 91044 B）
+- 编译必须 0 warning / 0 error：make -C Debug -j8 all（基线 text 91060 B）
 - 不许用改编译选项的方式压警告
 - 没有实测数据的，一律写「待实测」，不许编造数字
 - 不许破坏现有 LiDAR 流水线、s/g 控制台、PC 点云窗口
@@ -58,7 +58,7 @@ OLED 已接上并正常显示；无线演示流程（蓝牙下发命令 + 卷尺
 | 项 | 值 |
 |---|---|
 | 工程 | `D:\嵌入式小车\CodingDay_F446RE\`，分支 `part2` |
-| 编译 | `make -C Debug -j8 all`，**0 warning / 0 error**，基线 **text 91044 B** |
+| 编译 | `make -C Debug -j8 all`，**0 warning / 0 error**，基线 **text 91060 B** |
 | 主机测试 | `tools\host_tests\run_tests.cmd`（协议 50 项 + 路径 + 位姿，全过） |
 | 调试串口 | **COM8** @115200（ST-Link VCP，**需要 USB 线**） |
 | 蓝牙 | **COM10** @115200（HC-04 SPP，无线下发命令） |
@@ -294,7 +294,7 @@ tools\nav_run.cmd -Only 0,1400     :: 带线调试用，会读回终点位姿
 
 ## 10. 硬约束
 
-1. 编译 **0 warning / 0 error**，基线 text **91044 B**；不许改编译选项压警告
+1. 编译 **0 warning / 0 error**，基线 text **91060 B**；不许改编译选项压警告
 2. 没有实测的数据一律写「待实测」
 3. 不许破坏 LiDAR 流水线、`s`/`g` 控制台、PC 点云窗口
 4. 每改一小步就编译一次

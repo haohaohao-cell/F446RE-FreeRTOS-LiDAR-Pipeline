@@ -92,7 +92,24 @@ int imu_init(void)
 
   imu_present = 0U;
 
-  for (uint8_t attempt = 0U; attempt < 5U; attempt++)
+  /* HOW LONG TO WAIT FOR THE CHIP (fixed 2026-11-19)
+   * ------------------------------------------------
+   * This used to be 5 attempts x 20 ms = a 100 ms window, and it was too
+   * short.  On 2026-11-19 22:05 the board rebooted on battery power and the
+   * MPU-6500 never answered WHO_AM_I inside that window: it ACKed its address
+   * on an I2C scan (`d` found 0x68) but every register read failed, so the
+   * firmware declared the sensor absent.  That costs the gyro AND it stopped
+   * TIM6 (see imu_start), which made the whole 1 Hz line look broken.
+   *
+   * A battery cold start raises 3V3 more slowly than the USB-powered bench
+   * setup this was developed on, and the MPU-6500 wants up to ~100 ms of
+   * stable supply on top of that.  So: wait up to ~1 s, and poke the device
+   * out of sleep halfway through in case it is sitting in a state where it
+   * ACKs but does not serve reads.
+   *
+   * This only costs time when the sensor really is absent (boot, no
+   * scheduler, HAL_Delay is legal here - see the note above the bias loop). */
+  for (uint16_t attempt = 0U; attempt < 50U; attempt++)
   {
     who = 0U;
     imu_diag_status = (uint32_t)imu_rd(IMU_WHO_AM_I, &who, 1U);
@@ -103,6 +120,15 @@ int imu_init(void)
     {
       ok = 1U;
       break;
+    }
+
+    /* Halfway: release the device from sleep and its own self-test.  If the
+     * chip is merely sluggish this is what brings it back; if it is absent the
+     * write fails harmlessly. */
+    if (attempt == 25U)
+    {
+      (void)imu_wr(IMU_PWR_MGMT_1, 0x80U);
+      HAL_Delay(50U);
     }
 
     /* Boot only (no scheduler yet), so a blocking delay is acceptable here and
@@ -160,15 +186,19 @@ int imu_init(void)
 
 void imu_start(void)
 {
-  if (imu_present == 0U)
+  if (imu_present != 0U)
   {
-    return;
+    last_cycles = DWT->CYCCNT;
+    last_ms = HAL_GetTick();
   }
-  last_cycles = DWT->CYCCNT;
-  last_ms = HAL_GetTick();
 
-  /* TIM6 is the 10 ms cadence source.  Its ISR now only releases the semaphore
-   * that wakes the IMU task (see HAL_TIM_PeriodElapsedCallback below). */
+  /* TIM6 starts even when the sensor was not found.
+   *
+   * It used to return here, which meant one failed init also stopped the 10 ms
+   * cadence: the IMU task then timed out once per 100 ms (iw climbing at 10/s)
+   * and the 1 Hz line looked like a second, unrelated fault.  The cadence is a
+   * system resource, not a property of the sensor; with the sensor absent the
+   * task simply wakes, gets -1 from imu_sample_once() and returns. */
   HAL_TIM_Base_Start_IT(&htim6);
 }
 

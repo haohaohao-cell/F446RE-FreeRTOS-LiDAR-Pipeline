@@ -560,7 +560,7 @@ rpm     = v / (π*65) * 60                  // mm/s → rpm，单位换算只在
 ## 13. 怎么复现（评审可现场执行）
 
 ```cmd
-:: 0) 编译（必须 0 warning / 0 error，text 91044 B）
+:: 0) 编译（必须 0 warning / 0 error，text 91060 B）
 set PATH=<CubeIDE make 与 arm-none-eabi 的 bin>;%PATH%
 make -C Debug -j8 all
 
