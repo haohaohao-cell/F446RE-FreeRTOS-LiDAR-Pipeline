@@ -132,7 +132,7 @@ $lblHead.Size       = New-Object System.Drawing.Size(220, 40)
 $lblHead.Font       = $fontBig
 
 $lblHeadHint        = New-Object System.Windows.Forms.Label
-$lblHeadHint.Text   = "0° = 车头朝向铺设方向；左转为正、右转为负"
+$lblHeadHint.Text   = "0° = 摆放方向（驱动轮端）朝向；左转为正、右转为负"
 $lblHeadHint.Location = New-Object System.Drawing.Point(16, 64)
 $lblHeadHint.Size   = New-Object System.Drawing.Size(360, 24)
 $lblHeadHint.ForeColor = $grey

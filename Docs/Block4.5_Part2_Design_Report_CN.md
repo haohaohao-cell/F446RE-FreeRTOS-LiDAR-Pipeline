@@ -593,7 +593,7 @@ errors"——位置是主项，航向只是副项。而且转向两位移没被�
 ## 13. 怎么复现（评审可现场执行）
 
 ```cmd
-:: 0) 编译（必须 0 warning / 0 error，text 91048 B）
+:: 0) 编译（必须 0 warning / 0 error，text 91080 B）
 set PATH=<CubeIDE make 与 arm-none-eabi 的 bin>;%PATH%
 make -C Debug -j8 all
 

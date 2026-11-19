@@ -175,7 +175,7 @@ _Static_assert(BOARD_MOTOR_PWM_PERIOD <= 65535U, "TIM4 ARR does not fit");
  *   1 = reversed layout  (travel towards the driven wheels, caster trails).
  *       COMPILES, and the signs are derived in motor.c, but it has NEVER been
  *       driven on the floor - validate wheels-up before trusting it.          */
-#define BOARD_DRIVE_FRAME_REVERSED 0
+#define BOARD_DRIVE_FRAME_REVERSED 1
 
 /* lessonProgram MOTOR_DEFAULT_* values are kept as the TARGET clamp (they limit
  * the requested speed, which is a different thing from the duty).
