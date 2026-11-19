@@ -32,7 +32,7 @@
      蓝牙 COM10 ──"G 0 1400\n"──> UART5 ──DMA1_S0──> bt_rx.c ──信号量──> BT RX 任务
                                                                           │ Q_Cmd (4×8B, 满则覆盖最旧)
                                                                           v
-                                                                   PathGen 任务（100 mm 步长）
+                                                                   PathGen 任务（100 mm 步长，轴对齐 L 形）
                                                                           │ Q_Path (16×8B, 生产方阻塞)
                                                                           v
    TIM1/TIM8 硬件 QEP ──> Pose 任务 ────────────────────────────────> PID+Motor 任务（10 ms）
@@ -137,11 +137,16 @@ tools\serial_console.cmd                 :: 实时终端（s/g/f/b/l/r/x/c/e/i/h
 tools\nav_run.cmd -Only 0,1400
 
 :: 无线（验收用：只走蓝牙，终点用卷尺量）
+tools\bt_link_check.cmd          :: 先证明链路通（正常约 5000 B/s 遥测）
 tools\bt_run.cmd "0 1400"        :: 清零位姿 + 发目标，一条命令
+tools\bt_run.cmd "-700 700"      :: 直行 700 → 左转 90° → 直行 700
+tools\bt_run.cmd "700 700"       :: 直行 700 → 右转 90° → 直行 700
 tools\bt_send.cmd "S"           :: 只发单条（急停）
 ```
 
 车头方向约定：**+y 是车头向前，+x 是车的右侧**，坐标单位 mm，范围 ±5000。
+验收三趟是**十字形场地**的三条臂：正前 `(0, 1400)`、左前 `(−700, 700)`、右前 `(700, 700)`；
+路径一律**先直行、再转 90°、再直行**（轴对齐 L 形），不是"先转弯再走斜线"。
 
 ---
 
@@ -226,7 +231,7 @@ Core/Src/app.c          启动顺序、NVIC 优先级表、HAL 回调分发
 Core/Src/motor.c        TIM4/TIM2 PWM + 双轮 PID
 Core/Src/encoder.c      TIM1/TIM8 硬件 QEP（3 µs 输入滤波）
 Core/Src/pose.c         里程计 + 陀螺航向（陀螺优先，轮式兜底）
-Core/Src/path.c         100 mm 路点生成 + 航向控制律
+Core/Src/path.c         L 形（轴对齐）路点生成 + 航向控制律
 Core/Src/imu.c          MPU-6500，任务上下文采样
 Core/Src/i2c_bus.c      I2C1 唯一所有者：prio-inherit 互斥量 + 有界事务
 Core/Src/oled.c         SSD1306 128x64 + 6x8 字库，分页刷新

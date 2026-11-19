@@ -35,7 +35,7 @@ where the queue and semaphore evidence comes from.
      BT COM10 --"G 0 1400\n"--> UART5 --DMA1_S0--> bt_rx.c --sem--> BT RX task
                                                                        | Q_Cmd (4x8B, overwrite oldest)
                                                                        v
-                                                                 PathGen task (100 mm steps)
+                                                                 PathGen task (100 mm steps, axis-aligned L)
                                                                        | Q_Path (16x8B, producer blocks)
                                                                        v
    TIM1/TIM8 hardware QEP --> Pose task ---------------------------> PID+Motor task (10 ms)
@@ -232,12 +232,12 @@ Core/Src/app.c          boot order, NVIC priority table, HAL dispatch
 Core/Src/motor.c        TIM4/TIM2 PWM + dual PID
 Core/Src/encoder.c      TIM1/TIM8 hardware QEP (3 us input filter)
 Core/Src/pose.c         odometry + gyro heading (gyro first, wheels as fallback)
-Core/Src/path.c         100 mm waypoint generation + heading control law
+Core/Src/path.c         L-shaped (axis-aligned) waypoint generation + heading control law
 Core/Src/imu.c          MPU-6500, sampled in task context
 Core/Src/i2c_bus.c      sole owner of I2C1: prio-inherit mutex, bounded transfers
 Core/Src/oled.c         SSD1306 + 6x8 font (never run on a real panel)
 Core/Inc/board_pins.h   single source of truth for pins/timers/NVIC
-tools/                  bench_p0 / nav_run / bt_send / flash_and_monitor / serial_console
+tools/                  bench_p0 / nav_run / bt_send / bt_link_check / flash_and_monitor / serial_console
 tools/host_tests/       host-side unit tests (parser grammar, path generation, control law)
 Docs/                   report, demo material, coding standards, handover
 ```
