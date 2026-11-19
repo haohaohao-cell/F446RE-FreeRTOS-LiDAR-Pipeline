@@ -623,13 +623,16 @@ static void path_task(void *argument)
 
       pose_get(&pose);
 
-      /* Until odometry is calibrated, pose is (0,0) at boot, so this is a
-       * straight line from "where we think we are" to the commanded point.  No
-       * obstacle avoidance - that belongs to the final development block
-       * (CODING_STANDARDS 9.1). */
-      n = path_generate_line((int16_t)lroundf(pose.x_mm),
-                             (int16_t)lroundf(pose.y_mm),
-                             cmd.x_mm, cmd.y_mm, pts, Q_PATH_CAPACITY);
+      /* Axis-aligned path (Block 4.5 Part 2 slide 3): straight up the +y
+       * corridor first, then one 90 degree turn, then along the x corridor.
+       * A straight line would make the car turn first and drive diagonally,
+       * which is not the demonstrated path shape.  Until odometry is
+       * calibrated, pose is (0,0) at boot, so this is "where we think we are"
+       * to the commanded point.  No obstacle avoidance - that belongs to the
+       * final development block (CODING_STANDARDS 9.1). */
+      n = path_generate_manhattan((int16_t)lroundf(pose.x_mm),
+                                  (int16_t)lroundf(pose.y_mm),
+                                  cmd.x_mm, cmd.y_mm, pts, Q_PATH_CAPACITY);
       if (n < 0)
       {
         /* Does not fit in Q_Path: refuse rather than emit a partial path that

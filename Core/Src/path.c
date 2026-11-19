@@ -7,11 +7,13 @@
  * today is only that the code compiles and that the maths has no division by
  * zero / atan2(0,0) traps on the degenerate cases.
  *
- * WHY ONLY A STRAIGHT LINE: a real planner (A*, ICP/OGM) belongs to the final
- * development block.  Part 2 asks for "Bluetooth target -> path -> PID", so the
- * minimum honest implementation is: emit waypoints along the line to the target,
- * marked with the final one, and let the controller track them.  Replacing this
- * function with a planner does not touch the controller or the motor layer.
+ * WHY ONLY A STRAIGHT LINE / AN L: a real planner (A*, ICP/OGM) belongs to the
+ * final development block.  Part 2 asks for "Bluetooth target -> path -> PID",
+ * and the three acceptance trials are three arms of a cross-shaped maze whose
+ * corridors run along the world axes (Part 2 slides 2-3).  The honest minimum
+ * is therefore: emit the two axis-aligned legs to the target, mark the last
+ * point, and let the controller track them.  Replacing this function with a
+ * planner does not touch the controller or the motor layer.
  *
  * THE CONTROL LAW (pure pursuit reduced to heading + speed):
  *   1. bearing to the waypoint = atan2(dy, dx)
@@ -126,6 +128,95 @@ int path_generate_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
   /* Intentionally no stats update here: this is a pure geometry function, and
    * the caller already knows how many points it got (path_note_generated). */
   return (int)steps;
+}
+
+/* ---------------------------------------------------------------------------
+ * Axis-aligned paths (see path.h).  Written as two legs so that the corner is
+ * an explicit waypoint: the controller's "turn in place above 45 degrees" rule
+ * then does exactly one 90 degree pivot at the junction and nothing else.
+ * ------------------------------------------------------------------------ */
+
+/* Append `steps` points along one axis, from (xa,ya) towards (xb,yb), starting
+ * at out[first].  The last point is forced to the exact coordinate: rounding a
+ * cumulative float can leave it a millimetre short, and a corner that is 1 mm
+ * off is invisible in the log but ruins the tape-measure check. */
+static uint16_t manhattan_leg(int16_t xa, int16_t ya, int16_t xb, int16_t yb,
+                              uint16_t steps, path_point_t *out, uint16_t first)
+{
+  float fx = (float)(xb - xa);
+  float fy = (float)(yb - ya);
+  uint16_t i;
+
+  for (i = 0U; i < steps; i++)
+  {
+    float t = (float)(i + 1U) / (float)steps;
+    uint16_t k = (uint16_t)(first + i);
+
+    out[k].x_mm = (int16_t)lroundf((float)xa + (fx * t));
+    out[k].y_mm = (int16_t)lroundf((float)ya + (fy * t));
+    out[k].flags = 0U;
+    out[k].reserved = 0U;
+    out[k].index = k;
+  }
+
+  out[(uint16_t)(first + steps - 1U)].x_mm = xb;
+  out[(uint16_t)(first + steps - 1U)].y_mm = yb;
+
+  return steps;
+}
+
+int path_generate_manhattan(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                            path_point_t *out, uint16_t max_points)
+{
+  float dx = (float)(x1 - x0);
+  float dy = (float)(y1 - y0);
+  uint16_t n_y = 0U;
+  uint16_t n_x = 0U;
+  uint16_t total;
+
+  if ((out == NULL) || (max_points == 0U))
+  {
+    return -1;
+  }
+
+  if ((path_abs(dx) < 0.5f) && (path_abs(dy) < 0.5f))
+  {
+    /* Already there. */
+    return 0;
+  }
+
+  if (path_abs(dy) >= 0.5f)
+  {
+    n_y = (uint16_t)ceilf(path_abs(dy) / (float)PATH_STEP_MM);
+  }
+  if (path_abs(dx) >= 0.5f)
+  {
+    n_x = (uint16_t)ceilf(path_abs(dx) / (float)PATH_STEP_MM);
+  }
+
+  if (((uint32_t)n_y + (uint32_t)n_x) > (uint32_t)max_points)
+  {
+    return -2;
+  }
+
+  total = (uint16_t)(n_y + n_x);
+  if (total == 0U)
+  {
+    return 0;
+  }
+
+  if (n_y != 0U)
+  {
+    (void)manhattan_leg(x0, y0, x0, y1, n_y, out, 0U);
+  }
+  if (n_x != 0U)
+  {
+    (void)manhattan_leg(x0, y1, x1, y1, n_x, out, n_y);
+  }
+
+  out[(uint16_t)(total - 1U)].flags = (uint8_t)PATH_FLAG_FINAL;
+
+  return (int)total;
 }
 
 uint8_t path_arrived(const pose_t *pose, const path_point_t *wp)

@@ -5,8 +5,8 @@
  * --------------------------------------------------
  * Q_Path carries WORLD COORDINATE waypoints, never "grid cells" or "the next
  * Bluetooth command".  Two consequences worth keeping in mind:
- *   - today PathGen produces a straight line from the current pose to the target
- *     (no planner yet), and
+ *   - today PathGen produces an L-shaped (axis-aligned) path from the current
+ *     pose to the target (no planner yet), and
  *   - the final product's maze solver can replace exactly that producer without
  *     touching the PID/motor task, because both speak Q_Path.
  * The PID/motor task therefore never asks where a waypoint came from.
@@ -73,6 +73,28 @@ typedef struct
  * PATH_FLAG_FINAL. */
 int path_generate_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
                        path_point_t *out, uint16_t max_points);
+
+/* Axis-aligned ("Manhattan") path: first the whole y leg, then the whole x leg.
+ *
+ * WHY THIS EXISTS: the acceptance trials are three arms of a cross-shaped
+ * maze whose corridors run along the world axes (Block 4.5 Part 2, slide 3):
+ * the car must drive straight up the +y corridor, THEN turn 90 degrees, THEN
+ * drive up the +x/-x corridor.  A straight line to the same target would make
+ * the car turn first and drive diagonally, which is not the demonstration the
+ * marking scheme asks for.
+ *
+ *   leg 1: (x0,y0) -> (x0,y1)   along +y / -y   (no turn needed at the start)
+ *   leg 2: (x0,y1) -> (x1,y1)   along +x / -x   (one 90 degree turn at the corner)
+ *
+ * The corner (x0,y1) is emitted exactly once, as the last point of leg 1.  The
+ * controller turns in place there because the bearing to the first point of
+ * leg 2 is 90 degrees away from the current heading (PATH_TURN_ONLY_DEG).
+ *
+ * A pure axial target degenerates to a single leg, so the (0, 1400) trial
+ * produces exactly the same waypoints as path_generate_line().
+ * Return codes are the same as path_generate_line(). */
+int path_generate_manhattan(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                            path_point_t *out, uint16_t max_points);
 
 /* Tracking law: given the pose and the active waypoint, produce wheel RPM
  * targets.  Pure function, no state, no hardware. */
