@@ -15,6 +15,13 @@
 #
 # Both commands go out on the same port handle, Z first with a short settle, so
 # ordering cannot be lost between two processes.
+#
+# LINK RELIABILITY (added 2026-11-19)
+# -----------------------------------
+# Opening COM10 can succeed while the radio link is actually down, and then the
+# car silently never moves.  bt_common.ps1 reads the firmware's continuous
+# telemetry stream to prove the link carries bytes, and retries the open; this
+# script refuses to pretend a dead link is a successful run.
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
@@ -25,7 +32,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if ($Target -eq '') {
+. "$PSScriptRoot\bt_common.ps1"
+
+if ($Target -eq '')
+{
     Write-Host 'usage: bt_run.cmd "x y"     e.g. bt_run.cmd "0 1400"' -ForegroundColor Yellow
     Write-Host '       zeroes the pose, then drives to (x, y) over Bluetooth only' -ForegroundColor DarkGray
     exit 2
@@ -37,25 +47,37 @@ $parts = $t -split '\s+' | Where-Object { $_ -ne '' }
 if ($parts.Count -ne 2) { throw ('target must be "x y", got: ' + $Target) }
 $x = 0
 $y = 0
-if (-not [int]::TryParse($parts[0], [ref]$x) -or -not [int]::TryParse($parts[1], [ref]$y)) {
+if (-not [int]::TryParse($parts[0], [ref]$x) -or -not [int]::TryParse($parts[1], [ref]$y))
+{
     throw ('target must be two integers, got: ' + $Target)
 }
 
 $dist = [Math]::Sqrt([double]($x * $x + $y * $y))
-$eta = $dist / 120.0          # PATH_V_MAX_MM_S, straight-line only
+# Straight-line time at PATH_V_MAX_MM_S is a LOWER bound: the axis-aligned path
+# drives |y| + |x| and turns in place at the corner, so the real run is longer.
+$eta = $dist / 120.0
+$legs = [Math]::Abs($y) + [Math]::Abs($x)
+$etaLegs = $legs / 120.0
 
-try {
-    $sp = New-Object System.IO.Ports.SerialPort($Port, 115200, 'None', 8, 'One')
-    $sp.ReadTimeout = 200
-    $sp.Open()
-} catch {
-    Write-Host ("cannot open {0}: {1}" -f $Port, $_.Exception.Message) -ForegroundColor Red
-    Write-Host '  - HC-04 powered and paired?'
-    Write-Host '  - is the PC point-cloud viewer holding the port?'
+$sp = Open-BtPort -Port $Port
+if ($null -eq $sp)
+{
     exit 2
 }
 
-try {
+$ok = $false
+try
+{
+    # Prove the link carries bytes before spending the operator's trust on it.
+    $linkOk = Write-BtLinkReport -Port $sp -Ms 500
+    if (-not $linkOk)
+    {
+        Write-Host ''
+        Write-Host 'NOT sending the drive command on a dead link.' -ForegroundColor Red
+        Write-Host 'Double-click again in a few seconds; if it stays dead, check the module LED.' -ForegroundColor Yellow
+        exit 3
+    }
+
     # The first write after opening an SPP port is sometimes swallowed (the same
     # thing happens on the ST-Link VCP, which is why bench_p0 retries its 'h').
     # Losing the Z is the worst possible loss: G then runs against last time's
@@ -70,12 +92,18 @@ try {
 
     $sp.Write(('G {0} {1}' -f $x, $y) + "`n")
     Write-Host ('sent: G {0} {1}' -f $x, $y) -ForegroundColor Green
-    Write-Host ('      distance {0:F0} mm, expect about {1:F0} s of driving' -f $dist, $eta) -ForegroundColor DarkGray
+    Write-Host ('      target is {0:F0} mm away; the path is axis-aligned:' -f $dist) -ForegroundColor DarkGray
+    Write-Host ('      straight {0} mm along +y, then one 90 deg turn, then {1} mm along x' -f [Math]::Abs($y), [Math]::Abs($x)) -ForegroundColor DarkGray
+    Write-Host ('      expect about {0:F0} s of driving (total path {1:F0} mm)' -f $etaLegs, $legs) -ForegroundColor DarkGray
     Write-Host '      the car stops by itself when the path is done - do not touch it' -ForegroundColor DarkGray
 
     Start-Sleep -Milliseconds 400
-} finally {
+    $ok = $true
+}
+finally
+{
     try { $sp.Close(); $sp.Dispose() } catch { }
 }
 
+if (-not $ok) { exit 2 }
 exit 0
