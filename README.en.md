@@ -20,7 +20,7 @@ the demo.
 > been tape-measured yet (see [Known limitations](#known-limitations)). The
 > numbers that do exist are labelled with their measurement date.
 
-*Chinese version: [README.zh-CN.md](README.zh-CN.md).*
+*中文版：[README.md](README.md)*
 
 ---
 

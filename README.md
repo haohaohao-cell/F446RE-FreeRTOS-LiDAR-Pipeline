@@ -15,7 +15,7 @@ PID 闭环，到点自己停。激光流水线、OLED 面板和二进制遥测**
 > **诚实的缺口**：轴对齐路径的**物理端点误差还没用卷尺量过**（见「已知限制」）。
 > 已有的数字都标了测量日期。
 
-*English version: [README.md](README.md).*
+*英文版：[README.en.md](README.en.md)*
 
 ---
 
