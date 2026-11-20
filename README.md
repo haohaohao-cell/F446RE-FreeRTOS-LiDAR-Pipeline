@@ -241,6 +241,24 @@ tools\bench_p0.cmd -Test symmetry     :: wheel symmetry (wheels off the ground)
 tools\nav_run.cmd -Only 0,1400        :: tethered run, reads the endpoint pose back over COM8
 ```
 
+### What a fresh clone can and cannot do
+
+The repository is public: **all source, scripts and documents are readable**.
+
+*Running* it needs the hardware and a locally built image:
+
+| | |
+|---|---|
+| Read the code / report / scripts | works out of the box |
+| Build | needs STM32CubeIDE's `make` + `arm-none-eabi` on `PATH`; `Debug/` is git-ignored, so **no prebuilt `.elf` ships with the repo** |
+| Flash / drive | needs the board: ST-Link, the HC-04 paired as a COM port, the ST-Link VCP as another |
+| Port numbers | `COM8` (console) and `COM10` (Bluetooth) are **defaults, not discoveries** — every tool accepts `-Port COMx` |
+| Scripts | `.cmd` launchers + PowerShell; on Linux/macOS call the `.ps1` with `pwsh` |
+| Wiring | the tools assume exactly the map in [`Core/Inc/board_pins.h`](Core/Inc/board_pins.h): 2 motors, 2 encoders, IMU, OLED, LiDAR, HC-04 |
+
+So the scripts are reusable elsewhere, but not by double-clicking: they are tuned
+to this car's port names and this machine's toolchain layout.
+
 ---
 
 ## Reading the 1 Hz block
@@ -256,7 +274,6 @@ Seven lines per second, everything prefixed `[1s]`:
 [1s] T50: b51.26/1266/1116 o51.11/1114/17374 | ov b0 o0
 [1s] CNT: ql0 qc0 qpt0 imu0 bt(s0 r0 o0 u0) log0 iw0
 ```
-
 | Line | Meaning |
 |---|---|
 | 1 | LiDAR block rate / `Q_Lidar` peak / worst parse time; motor period, jitter, WCET; `Q_Cmd` depth |

@@ -222,6 +222,23 @@ tools\bench_p0.cmd -Test symmetry     :: 左右对称性（轮子要架空）
 tools\nav_run.cmd -Only 0,1400        :: 带线跑，从 COM8 读回终点位姿
 ```
 
+### 别人克隆下来能做什么、不能做什么
+
+仓库是**公开**的：**所有源码、脚本、文档都能看**。
+
+但**跑起来**需要硬件和本地编译产物：
+
+| | |
+|---|---|
+| 读代码 / 报告 / 脚本 | 开箱即可 |
+| 编译 | 需要 STM32CubeIDE 的 `make` + `arm-none-eabi` 在 `PATH` 里；`Debug/` 被 git 忽略，**仓库里没有现成的 `.elf`** |
+| 烧录 / 跑车 | 需要那块板子：ST-Link、配对好的 HC-04、ST-Link 虚拟串口 |
+| 端口号 | `COM8`（控制台）和 `COM10`（蓝牙）是**默认值，不是自动发现的**——每个工具都接受 `-Port COMx` |
+| 脚本 | `.cmd` 启动器 + PowerShell；Linux/macOS 上用 `pwsh` 直接调 `.ps1` |
+| 接线 | 工具假定与 [`Core/Inc/board_pins.h`](Core/Inc/board_pins.h) 完全一致：2 电机、2 编码器、IMU、OLED、雷达、HC-04 |
+
+所以脚本可以复用，但**不是双击就能跑**：它们绑定的是这台车的端口名和这台机器的工具链路径。
+
 ---
 
 ## 看懂 1 Hz 状态块
