@@ -883,6 +883,7 @@ static void bt_tx_task(void *argument)
     if ((slot % 2U) != 0U)
     {
       imu_sample_t sample;
+      pose_t p;
 
       /* The LiDAR task is the only writer of the 360-bin map; a short critical
        * section gives a consistent snapshot (CODING_STANDARDS 1.5). */
@@ -891,9 +892,16 @@ static void bt_tx_task(void *argument)
       taskEXIT_CRITICAL();
 
       imu_get(&sample);
+
+      /* The pose rides along with the scan so the PC console can draw the path
+       * live.  pose_get() takes the same short critical section it always does,
+       * and the frame stays well below the 115200 budget (740 B at ~10 Hz). */
+      pose_get(&p);
+
       /* Non-blocking: if UART5 TX is still busy this frame is dropped and
        * counted by telemetry.c. */
-      (void)telemetry_send_data(&sample, scan_frame);
+      (void)telemetry_send_data(&sample, scan_frame,
+                                (int16_t)lroundf(p.x_mm), (int16_t)lroundf(p.y_mm));
     }
 
     if ((slot % (APP_STATUS_PERIOD_MS / APP_PERIOD_SLOW_MS)) == 0U)

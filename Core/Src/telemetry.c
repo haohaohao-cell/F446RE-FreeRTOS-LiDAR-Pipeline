@@ -195,9 +195,10 @@ void telemetry_init(void)
   telemetry_dma_init();
 }
 
-int telemetry_send_data(const imu_sample_t *s, const uint16_t *dist)
+int telemetry_send_data(const imu_sample_t *s, const uint16_t *dist,
+                        int16_t x_mm, int16_t y_mm)
 {
-  uint16_t payload_len = (uint16_t)(DATA_FIXED + (SCAN_POINTS * 2U));
+  uint16_t payload_len = (uint16_t)(DATA_FIXED + (SCAN_POINTS * 2U) + 4U);
   uint16_t pos;
 
   if (tx_busy != 0U)
@@ -222,6 +223,16 @@ int telemetry_send_data(const imu_sample_t *s, const uint16_t *dist)
     put16(&tx_buf[pos], dist[i]);
     pos += 2U;
   }
+
+  /* Pose, APPENDED AFTER the scan so that existing readers keep working: the
+   * frame header carries the length and the point count, and both this
+   * repository's PC viewer and the drive console stop reading once they have
+   * n distances.  Appending is backwards compatible; inserting in the middle
+   * would not be. */
+  put16(&tx_buf[pos], (uint16_t)x_mm);
+  pos += 2U;
+  put16(&tx_buf[pos], (uint16_t)y_mm);
+  pos += 2U;
 
   pos = frame_finish(pos);
   return frame_send(pos);

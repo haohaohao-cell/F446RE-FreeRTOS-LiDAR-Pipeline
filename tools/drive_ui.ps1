@@ -55,6 +55,22 @@ $script:heading       = $null
 $script:minDist       = $null
 $script:lastSend      = ''
 
+# ---- live path view -------------------------------------------------------
+# The firmware appends the pose (mm) to the telemetry frame, so the console can
+# draw where the car actually is.  Three separate notions, kept apart on
+# purpose:
+#   plan   - the waypoints the firmware was asked to follow (recomputed here
+#            with the same rule: whole y leg, then whole x leg, 100 mm steps)
+#   trail  - where the car reported it had got to
+#   target - the commanded endpoint
+# Keeping the plan separate from the trail is the whole point: if the two
+# diverge, that is the control error, and it is visible at a glance.
+$script:plan          = New-Object 'System.Collections.ArrayList'
+$script:trail         = New-Object 'System.Collections.ArrayList'
+$script:target        = $null
+$script:pose          = $null
+$script:headingDeg    = $null
+
 $font       = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
 $fontSmall  = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
 $fontBig    = New-Object System.Drawing.Font('Microsoft YaHei UI', 20, [System.Drawing.FontStyle]::Bold)
@@ -69,7 +85,7 @@ $grey       = [System.Drawing.Color]::FromArgb(90, 90, 90)
 $form                 = New-Object System.Windows.Forms.Form
 $form.Text            = '循迹小车 · 蓝牙遥控台（Block 4.5 Part 2）'
 $form.AutoScaleMode   = 'None'
-$form.ClientSize      = New-Object System.Drawing.Size(796, 662)
+$form.ClientSize      = New-Object System.Drawing.Size(1136, 662)
 $form.StartPosition   = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox     = $false
@@ -238,7 +254,33 @@ $txtLog.Size        = New-Object System.Drawing.Size(770, 196)
 $txtLog.Font        = New-Object System.Drawing.Font('Consolas', 9)
 $txtLog.BackColor   = [System.Drawing.Color]::FromArgb(250, 250, 250)
 
-$form.Controls.AddRange(@($grpLink, $grpLive, $grpCmd, $lblLogCap, $txtLog))
+# --- live path viewer -------------------------------------------------------
+$grpPath            = New-Object System.Windows.Forms.GroupBox
+$grpPath.Text       = '实时轨迹（俯视，单位 mm）'
+$grpPath.Location   = New-Object System.Drawing.Point(792, 10)
+$grpPath.Size       = New-Object System.Drawing.Size(332, 434)
+$grpPath.Font       = $fontSmall
+
+$pnlPath            = New-Object System.Windows.Forms.Panel
+$pnlPath.Location   = New-Object System.Drawing.Point(10, 22)
+$pnlPath.Size       = New-Object System.Drawing.Size(312, 372)
+$pnlPath.BackColor  = [System.Drawing.Color]::White
+$pnlPath.BorderStyle = 'FixedSingle'
+# DoubleBuffered is not a public property on Panel; turn it on via reflection,
+# otherwise every repaint flickers.
+$prop = $pnlPath.GetType().GetProperty('DoubleBuffered',
+        [System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::NonPublic)
+if ($prop) { $prop.SetValue($pnlPath, $true, $null) }
+
+$lblPathLegend      = New-Object System.Windows.Forms.Label
+$lblPathLegend.Text = "虚线 = 计划路径   实线 = 实际轨迹`n○ = 目标     ▲ = 车（箭头朝车头）"
+$lblPathLegend.Location = New-Object System.Drawing.Point(10, 400)
+$lblPathLegend.Size = New-Object System.Drawing.Size(312, 28)
+$lblPathLegend.ForeColor = $grey
+
+$grpPath.Controls.AddRange(@($pnlPath, $lblPathLegend))
+
+$form.Controls.AddRange(@($grpLink, $grpLive, $grpCmd, $lblLogCap, $txtLog, $grpPath))
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -399,6 +441,26 @@ function Send-Target
 
     if (-not (Send-Line ('G {0} {1}' -f $X, $Y))) { return }
 
+    # The plan is drawn from the moment the command goes out, so the operator
+    # can see where the car is *supposed* to go before it moves.  It mirrors
+    # path_generate_manhattan(): the whole y leg first, then the whole x leg,
+    # 100 mm steps, with the corner emitted once.  After Z the car is at (0,0)
+    # by definition, so leg 1 runs along x = 0.
+    $script:plan.Clear()
+    $script:trail.Clear()
+    $script:target = @($X, $Y)
+    $nY = if ($Y -ne 0) { [int][Math]::Ceiling([Math]::Abs($Y) / 100.0) } else { 0 }
+    $nX = if ($X -ne 0) { [int][Math]::Ceiling([Math]::Abs($X) / 100.0) } else { 0 }
+    for ($i = 1; $i -le $nY; $i++)
+    {
+        [void]$script:plan.Add(@(0, [int][Math]::Round($Y * $i / $nY)))
+    }
+    for ($i = 1; $i -le $nX; $i++)
+    {
+        [void]$script:plan.Add(@([int][Math]::Round($X * $i / $nX), $Y))
+    }
+    $pnlPath.Invalidate()
+
     $legs = [Math]::Abs($X) + [Math]::Abs($Y)
     $secs = $legs / 120.0
     $script:lastSend = ('G {0} {1}' -f $X, $Y)
@@ -469,6 +531,39 @@ function Read-Telemetry
             }
             if ($minD -ne 65535) { $script:minDist = $minD }
 
+            # Pose, appended after the scan (firmware >= 2026-11-20).  An older
+            # build simply has no extra bytes, so check the length before reading
+            # - the console must keep working against a flashed-old board.
+            $poseOffset = 15 + (2 * $points)
+            if (($poseOffset + 4) -le (5 + $len))
+            {
+                $px = [int]$script:rx[$poseOffset] -bor ([int]$script:rx[$poseOffset + 1] -shl 8)
+                if ($px -ge 32768) { $px -= 65536 }
+                $py = [int]$script:rx[$poseOffset + 2] -bor ([int]$script:rx[$poseOffset + 3] -shl 8)
+                if ($py -ge 32768) { $py -= 65536 }
+                $script:pose = @($px, $py)
+                $script:headingDeg = $raw / 100.0
+
+                # Trail: only keep a point when the car has actually moved, so
+                # a stationary car does not fill the list at 10 Hz.
+                $add = $true
+                if ($script:trail.Count -gt 0)
+                {
+                    $last = $script:trail[$script:trail.Count - 1]
+                    $dx = $px - $last[0]
+                    $dy = $py - $last[1]
+                    if (([Math]::Abs($dx) + [Math]::Abs($dy)) -lt 8)
+                    {
+                        $add = $false
+                    }
+                }
+                if ($add)
+                {
+                    [void]$script:trail.Add(@($px, $py))
+                    if ($script:trail.Count -gt 4000) { $script:trail.RemoveAt(0) }
+                }
+            }
+
             $script:okFrames++
             $script:framesTick++
         }
@@ -477,9 +572,131 @@ function Read-Telemetry
     }
 }
 
-function Update-Readouts
+function Draw-PathView
 {
-    $now = [DateTime]::Now
+    param([System.Drawing.Graphics]$g)
+
+    $w = $pnlPath.ClientSize.Width
+    $h = $pnlPath.ClientSize.Height
+    $g.Clear([System.Drawing.Color]::White)
+
+    # ---- collect the extent: origin, plan, trail, target, car -------------
+    $xs = New-Object 'System.Collections.Generic.List[double]'
+    $ys = New-Object 'System.Collections.Generic.List[double]'
+    [void]$xs.Add(0); [void]$ys.Add(0)
+    foreach ($p in $script:plan)  { [void]$xs.Add($p[0]); [void]$ys.Add($p[1]) }
+    foreach ($p in $script:trail) { [void]$xs.Add($p[0]); [void]$ys.Add($p[1]) }
+    if ($null -ne $script:target) { [void]$xs.Add($script:target[0]); [void]$ys.Add($script:target[1]) }
+    if ($null -ne $script:pose)   { [void]$xs.Add($script:pose[0]);   [void]$ys.Add($script:pose[1]) }
+
+    if (($script:plan.Count -eq 0) -and ($script:trail.Count -eq 0))
+    {
+        $g.DrawString('发一条命令后，这里显示计划路径和实际轨迹',
+                      (New-Object System.Drawing.Font('Microsoft YaHei UI', 9)),
+                      [System.Drawing.Brushes]::Gray, 12, 16)
+        return
+    }
+
+    $minX = ($xs | Measure-Object -Minimum).Minimum
+    $maxX = ($xs | Measure-Object -Maximum).Maximum
+    $minY = ($ys | Measure-Object -Minimum).Minimum
+    $maxY = ($ys | Measure-Object -Maximum).Maximum
+
+    # A minimum window keeps the view from zooming absurdly into a 20 mm wiggle,
+    # and the pad keeps the markers off the border.
+    $spanX = [Math]::Max($maxX - $minX, 400.0)
+    $spanY = [Math]::Max($maxY - $minY, 400.0)
+    $span  = [Math]::Max($spanX, $spanY) * 1.12
+    $scale = [Math]::Min(($w - 24) / $span, ($h - 24) / $span)
+
+    $cx = ($minX + $maxX) / 2.0
+    $cy = ($minY + $maxY) / 2.0
+    $ox = ($w / 2.0) - ($cx * $scale)
+    $oy = ($h / 2.0) + ($cy * $scale)
+
+    function PX([double]$x) { return $ox + ($x * $scale) }
+    function PY([double]$y) { return $oy - ($y * $scale) }
+
+    # ---- grid -------------------------------------------------------------
+    $step = 500.0
+    if ($span -lt 1500) { $step = 200.0 }
+    if ($span -lt 700)  { $step = 100.0 }
+    $gridPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(232, 232, 232), 1)
+    $gx = [Math]::Floor($minX / $step) * $step
+    while ($gx -le ($maxX + $step)) { $g.DrawLine($gridPen, (PX $gx), 0, (PX $gx), $h); $gx += $step }
+    $gy = [Math]::Floor($minY / $step) * $step
+    while ($gy -le ($maxY + $step)) { $g.DrawLine($gridPen, 0, (PY $gy), $w, (PY $gy)); $gy += $step }
+
+    $axisPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(200, 200, 200), 1)
+    $g.DrawLine($axisPen, (PX 0), 0, (PX 0), $h)
+    $g.DrawLine($axisPen, 0, (PY 0), $w, (PY 0))
+
+    # ---- plan (dashed) ----------------------------------------------------
+    if ($script:plan.Count -gt 0)
+    {
+        $planPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(60, 60, 60), 1.6)
+        $planPen.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dash
+        $prevX = 0.0; $prevY = 0.0
+        foreach ($p in $script:plan)
+        {
+            $g.DrawLine($planPen, (PX $prevX), (PY $prevY), (PX $p[0]), (PY $p[1]))
+            $prevX = $p[0]; $prevY = $p[1]
+        }
+        $planPen.Dispose()
+    }
+
+    # ---- trail (solid) ----------------------------------------------------
+    if ($script:trail.Count -gt 1)
+    {
+        $trailPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(0, 102, 204), 2.2)
+        for ($i = 1; $i -lt $script:trail.Count; $i++)
+        {
+            $a = $script:trail[$i - 1]
+            $b = $script:trail[$i]
+            $g.DrawLine($trailPen, (PX $a[0]), (PY $a[1]), (PX $b[0]), (PY $b[1]))
+        }
+        $trailPen.Dispose()
+    }
+
+    # ---- target -----------------------------------------------------------
+    if ($null -ne $script:target)
+    {
+        $tx = PX $script:target[0]; $ty = PY $script:target[1]
+        $targetPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(200, 0, 0), 2)
+        $g.DrawEllipse($targetPen, ($tx - 6), ($ty - 6), 12, 12)
+        $g.DrawLine($targetPen, ($tx - 10), $ty, ($tx + 10), $ty)
+        $g.DrawLine($targetPen, $tx, ($ty - 10), $tx, ($ty + 10))
+        $targetPen.Dispose()
+    }
+
+    # ---- car --------------------------------------------------------------
+    if ($null -ne $script:pose)
+    {
+        $px = PX $script:pose[0]; $py = PY $script:pose[1]
+        # The telemetry heading is the IMU heading, whose zero is the direction
+        # the car faced at power-up.  The pose frame is that direction rotated
+        # +90 deg (see pose.c POSE_IMU_TO_NAV_DEG), so the world angle is
+        # heading + 90.  Screen y grows downwards, hence the sign on sin.
+        $ang = (([double]$script:heading) + 90.0) * [Math]::PI / 180.0
+        $ux = [Math]::Cos($ang); $uy = -[Math]::Sin($ang)
+        $vx = -$uy; $vy = $ux
+        $tipLen = 9.0; $back = 6.0; $half = 5.0
+        $p1 = New-Object System.Drawing.PointF(($px + ($ux * $tipLen)), ($py + ($uy * $tipLen)))
+        $p2 = New-Object System.Drawing.PointF(($px - ($ux * $back) + ($vx * $half)), ($py - ($uy * $back) + ($vy * $half)))
+        $p3 = New-Object System.Drawing.PointF(($px - ($ux * $back) - ($vx * $half)), ($py - ($uy * $back) - ($vy * $half)))
+        $carBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(220, 90, 0))
+        $g.FillPolygon($carBrush, @($p1, $p2, $p3))
+        $carBrush.Dispose()
+    }
+
+    # ---- scale hint -------------------------------------------------------
+    $hint = '1 格 = {0:F0} mm' -f $step
+    $g.DrawString($hint, (New-Object System.Drawing.Font('Microsoft YaHei UI', 8)),
+                  [System.Drawing.Brushes]::Gray, 6, ($h - 18))
+}
+
+function Update-Readouts
+{    $now = [DateTime]::Now
     $elapsed = ($now - $script:lastTick).TotalMilliseconds
     if ($elapsed -ge 1000)
     {
@@ -543,12 +760,18 @@ $timer.Interval = 150
 $timer.Add_Tick({
     Read-Telemetry
     Update-Readouts
+    $pnlPath.Invalidate()
+})
+
+$pnlPath.Add_Paint({
+    param($sender, $e)
+    Draw-PathView $e.Graphics
 })
 
 $form.Add_Shown({
     Write-Log '窗口已就绪。点"连接"占用 COM10，然后点目标按钮或输入坐标。'
     Write-Log '注意：窗口开着时 bt_run / preflight_link 打不开 COM10（正常）。'
-    Write-Log '航向来自遥测；车自己认为的 x/y 只在 COM8（USB 线）上有，这个窗口看不到。'
+    Write-Log '右侧画布：虚线是计划路径，实线是车自报的实际轨迹，▲ 是车（箭头朝车头）。'
     if ($txtPort.Text.Trim() -ne '') { Open-Port }
 })
 
